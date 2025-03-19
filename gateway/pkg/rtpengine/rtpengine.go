@@ -182,7 +182,7 @@ func (r *RTPEngine) Request(ctx context.Context, command map[string]interface{})
 	response := responseBuffer[:n]
 
 	// Check the cookie
-	if !string(response[:len(cookie)]) == cookie {
+	if string(response[:len(cookie)]) != cookie {
 		r.circuitBreaker.RecordFailure()
 		return nil, fmt.Errorf("cookie mismatch in response")
 	}

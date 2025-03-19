@@ -13,10 +13,11 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/jart/gosip/sip"
+
 	"go.uber.org/zap"
 
 	"gateway/pkg/common"
+	"gateway/pkg/sip"
 	"gateway/pkg/storage"
 )
 
@@ -117,10 +118,11 @@ func NewServer(config ServerConfig, storage storage.StateStorage, logger *zap.Lo
 			},
 			Subprotocols: []string{"sip"},
 		},
+		// In pkg/websocket/server.go, update the code to:
 		circuitBreaker: common.NewCircuitBreaker("websocket", common.CircuitBreakerConfig{
 			FailureThreshold: 5,
-			ResetSeconds:     30,
-			HalfOpenMax:      3,
+			ResetTimeout:     30 * time.Second,
+			HalfOpenMaxReqs:  3,
 		}, logger),
 	}
 

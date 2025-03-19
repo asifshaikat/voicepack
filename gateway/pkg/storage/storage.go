@@ -162,6 +162,8 @@ type StateStorage interface {
 	Stats(ctx context.Context) (*StorageStats, error)
 	Cleanup(ctx context.Context) error
 	Close() error
+	// Add to the StateStorage interface
+	ListAMIActionIDs(ctx context.Context) ([]string, error)
 }
 
 // Helper functions for JSON encoding/decoding

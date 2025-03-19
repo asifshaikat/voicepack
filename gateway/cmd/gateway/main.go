@@ -14,7 +14,9 @@ import (
 	"go.uber.org/zap/zapcore"
 
 	"gateway/pkg/ami"
+	"gateway/pkg/common"
 	"gateway/pkg/config"
+	"gateway/pkg/coordinator"
 	"gateway/pkg/rtpengine"
 	"gateway/pkg/sip"
 	"gateway/pkg/storage"
@@ -26,7 +28,7 @@ func main() {
 	configPath := flag.String("config", "config.yaml", "Path to configuration file")
 	flag.Parse()
 
-	// Load configuration
+	// Load configuration from YAML file
 	cfg, err := config.LoadConfig(*configPath)
 	if err != nil {
 		log.Fatalf("Failed to load configuration: %v", err)
@@ -35,35 +37,50 @@ func main() {
 	// Setup logger
 	logger := setupLogger(cfg.LogLevel)
 	defer logger.Sync()
+	sipCfg := sip.SIPConfig{
+		UDPBindAddr:    cfg.SIP.UDPBindAddr,
+		ProxyURI:       cfg.SIP.ProxyURI,
+		DefaultNextHop: cfg.SIP.DefaultNextHop,
+		MaxForwards:    cfg.SIP.MaxForwards,
+		UserAgent:      cfg.SIP.UserAgent,
+	}
 
 	// Create storage
 	var stateStorage storage.StateStorage
 	if cfg.Redis.Enabled {
-		// Create Redis storage
-		stateStorage, err = storage.NewRedisStorage(cfg.Redis, logger)
+		// Uncomment and implement if Redis storage is available:
+		// stateStorage, err = storage.NewRedisStorage(cfg.Redis, logger)
+		// if err != nil {
+		//     logger.Fatal("Failed to create Redis storage", zap.Error(err))
+		// }
+		logger.Info("Redis storage not implemented; using in-memory storage")
+		stateStorage, err = storage.NewMemoryStorage(storage.MemoryConfig{
+			MaxKeys:         cfg.MemoryStorage.MaxKeys,
+			CleanupInterval: time.Duration(cfg.MemoryStorage.CleanupIntervalSeconds) * time.Second,
+			PersistPath:     cfg.MemoryStorage.PersistPath,
+		}, logger)
 	} else {
-		// Create in-memory storage
 		stateStorage, err = storage.NewMemoryStorage(storage.MemoryConfig{
 			MaxKeys:         cfg.MemoryStorage.MaxKeys,
 			CleanupInterval: time.Duration(cfg.MemoryStorage.CleanupIntervalSeconds) * time.Second,
 			PersistPath:     cfg.MemoryStorage.PersistPath,
 		}, logger)
 	}
-
 	if err != nil {
 		logger.Fatal("Failed to create storage", zap.Error(err))
 	}
 
-	// Create coordinator for high availability
-	coordinator, err := common.NewCoordinator(stateStorage, common.CoordinatorConfig{
-		HeartbeatInterval: 5 * time.Second,
-		LeaseTimeout:      15 * time.Second,
+	// Create a background context for coordinator registration
+	ctx := context.Background()
+
+	// Create coordinator using configuration getters for heartbeat and lease timeouts
+	coordinator, err := coordinator.NewCoordinator(stateStorage, coordinator.CoordinatorConfig{
+		HeartbeatInterval: cfg.GetHeartbeatInterval(),
+		LeaseTimeout:      cfg.GetLeaseTimeout(),
 	}, logger)
 	if err != nil {
 		logger.Fatal("Failed to create coordinator", zap.Error(err))
 	}
-
-	// Start the coordinator
 	if err := coordinator.Start(ctx); err != nil {
 		logger.Fatal("Failed to start coordinator", zap.Error(err))
 	}
@@ -74,64 +91,68 @@ func main() {
 	coordinator.RegisterComponentLeadership("ami")
 	coordinator.RegisterComponentLeadership("sip")
 	coordinator.RegisterComponentLeadership("websocket")
-	// Create RTPEngine manager
-	rtpManager, err := rtpengine.NewManager(cfg.RTPEngine, logger, stateStorage)
+
+	// Create RTPEngine manager using the converted configuration
+	rtpManager, err := rtpengine.NewManager(cfg.ToRTPEngineManagerConfig(), logger, common.NewGoroutineRegistry(logger), stateStorage, coordinator)
 	if err != nil {
 		logger.Fatal("Failed to create RTPEngine manager", zap.Error(err))
 	}
 
-	// Create AMI manager
-	amiManager, err := ami.NewManager(cfg.Asterisk, logger, stateStorage)
+	// Create AMI manager using the converted configuration
+	amiManager, err := ami.NewManager(cfg.ToAsteriskManagerConfig(), logger, common.NewGoroutineRegistry(logger), stateStorage, coordinator)
 	if err != nil {
 		logger.Fatal("Failed to create AMI manager", zap.Error(err))
 	}
 
-	// Create SIP proxy
-	sipProxy, err := sip.NewProxy(cfg.SIP, stateStorage, rtpManager, logger)
+	// Create SIP proxy (make sure sip.NewProxy is exported from your SIP package)
+	sipProxy, err := sip.NewProxy(sipCfg, stateStorage, rtpManager, logger)
 	if err != nil {
 		logger.Fatal("Failed to create SIP proxy", zap.Error(err))
 	}
 
-	// Create UDP transport for SIP
+	// Create UDP transport for SIP (ensure sip.NewUDPTransport is exported)
 	udpTransport, err := sip.NewUDPTransport(cfg.SIP.UDPBindAddr, logger)
 	if err != nil {
 		logger.Fatal("Failed to create UDP transport", zap.Error(err))
 	}
-
-	// Add transport to proxy
 	sipProxy.AddTransport(udpTransport)
 
+	// Convert WebSocket configuration from config.WebSocketConfig using getters
+	wsConfig := websocket.ServerConfig{
+		BindAddr:       cfg.WebSocket.BindAddr,
+		CertFile:       cfg.WebSocket.CertFile,
+		KeyFile:        cfg.WebSocket.KeyFile,
+		MaxConnections: cfg.WebSocket.MaxConnections,
+		ReadTimeout:    cfg.GetWebSocketReadTimeout(),
+		WriteTimeout:   cfg.GetWebSocketWriteTimeout(),
+		IdleTimeout:    cfg.GetWebSocketIdleTimeout(),
+		EnableIPv4Only: cfg.WebSocket.EnableIPv4Only,
+		ServerName:     cfg.WebSocket.ServerName,
+	}
+
 	// Create WebSocket server
-	wsServer, err := websocket.NewServer(cfg.WebSocket, stateStorage, logger)
+	wsServer, err := websocket.NewServer(wsConfig, stateStorage, logger)
 	if err != nil {
 		logger.Fatal("Failed to create WebSocket server", zap.Error(err))
 	}
-
-	// Set SIP handler for WebSocket
+	// Set SIP handler for WebSocket (assuming SIP proxy implements the SIPHandler interface)
 	wsServer.SetSIPHandler(sipProxy)
 
-	// Create context for coordinated shutdown
-	ctx, cancel := context.WithCancel(context.Background())
+	// Create a context for coordinated shutdown
+	shutdownCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	// Start components
 	logger.Info("Starting WebRTC-SIP Gateway...")
 
-	// Start RTPEngine manager
-	rtpManager.Start(ctx)
-
-	// Start AMI manager
-	if err := amiManager.Start(ctx); err != nil {
+	rtpManager.Start(shutdownCtx)
+	if err := amiManager.Start(shutdownCtx); err != nil {
 		logger.Fatal("Failed to start AMI manager", zap.Error(err))
 	}
-
-	// Start SIP proxy
-	if err := sipProxy.Start(ctx); err != nil {
+	if err := sipProxy.Start(shutdownCtx); err != nil {
 		logger.Fatal("Failed to start SIP proxy", zap.Error(err))
 	}
-
-	// Start WebSocket server
-	if err := wsServer.Start(ctx); err != nil {
+	if err := wsServer.Start(shutdownCtx); err != nil {
 		logger.Fatal("Failed to start WebSocket server", zap.Error(err))
 	}
 
@@ -140,38 +161,20 @@ func main() {
 	// Handle signals for graceful shutdown
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
-	// Wait for shutdown signal
 	sig := <-sigCh
 	logger.Info("Shutdown signal received", zap.String("signal", sig.String()))
-
-	// Cancel context to initiate coordinated shutdown
 	cancel()
 
-	// Graceful shutdown
 	logger.Info("Shutting down components...")
 
 	// Shutdown components in reverse order
-	shutdownTimeout := time.Duration(cfg.ShutdownWaitSeconds) * time.Second
-
-	// Create shutdown context with timeout
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
-	defer shutdownCancel()
-
-	// Stop WebSocket server
 	if err := wsServer.Stop(); err != nil {
 		logger.Error("Failed to stop WebSocket server", zap.Error(err))
 	}
-
-	// Stop SIP proxy
 	if err := sipProxy.Stop(); err != nil {
 		logger.Error("Failed to stop SIP proxy", zap.Error(err))
 	}
-
-	// Stop AMI manager
 	amiManager.Shutdown()
-
-	// Close storage
 	if err := stateStorage.Close(); err != nil {
 		logger.Error("Failed to close storage", zap.Error(err))
 	}
@@ -181,7 +184,6 @@ func main() {
 
 func setupLogger(level string) *zap.Logger {
 	var logLevel zapcore.Level
-
 	switch level {
 	case "debug":
 		logLevel = zapcore.DebugLevel
@@ -215,7 +217,6 @@ func setupLogger(level string) *zap.Logger {
 			EncodeCaller:   zapcore.ShortCallerEncoder,
 		},
 	}
-
 	logger, _ := config.Build()
 	return logger
 }

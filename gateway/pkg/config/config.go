@@ -7,6 +7,11 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	// Add these imports
+	"gateway/pkg/ami"
+	"gateway/pkg/common"
+	"gateway/pkg/rtpengine"
 )
 
 // Config represents the main configuration for the gateway
@@ -191,13 +196,51 @@ func LoadConfig(path string) (*Config, error) {
 }
 
 // ToRTPEngineManagerConfig converts the configuration to RTPEngine manager config
-func (c *Config) ToRTPEngineManagerConfig() RTPEngineConfig {
-	return c.RTPEngine
+// REPLACE this method with the implementation below
+func (c *Config) ToRTPEngineManagerConfig() rtpengine.ManagerConfig {
+	// Create and return a proper rtpengine.ManagerConfig
+	engines := make([]rtpengine.Config, 0, len(c.RTPEngine.Engines))
+	for _, eng := range c.RTPEngine.Engines {
+		engines = append(engines, rtpengine.Config{
+			Address: eng.Address,
+			Port:    eng.Port,
+
+			Weight: eng.Weight,
+			CircuitBreaker: common.CircuitBreakerConfig{
+				FailureThreshold: eng.CircuitBreaker.FailureThreshold,
+				ResetTimeout:     time.Duration(eng.CircuitBreaker.ResetSeconds) * time.Second,
+				HalfOpenMaxReqs:  eng.CircuitBreaker.HalfOpenMax,
+			},
+		})
+	}
+
+	return rtpengine.ManagerConfig{
+		Engines: engines,
+	}
 }
 
 // ToAsteriskManagerConfig converts the configuration to Asterisk manager config
-func (c *Config) ToAsteriskManagerConfig() AsteriskConfig {
-	return c.Asterisk
+// REPLACE this method with the implementation below
+func (c *Config) ToAsteriskManagerConfig() ami.ManagerConfig {
+	// Create and return a proper ami.ManagerConfig
+	clients := make([]ami.Config, 0, len(c.Asterisk.Clients))
+	for _, client := range c.Asterisk.Clients {
+		clients = append(clients, ami.Config{
+			Address:  client.Address,
+			Username: client.Username,
+			Secret:   client.Secret,
+
+			CircuitBreaker: common.CircuitBreakerConfig{
+				FailureThreshold: client.CircuitBreaker.FailureThreshold,
+				ResetTimeout:     time.Duration(client.CircuitBreaker.ResetSeconds) * time.Second,
+				HalfOpenMaxReqs:  client.CircuitBreaker.HalfOpenMax,
+			},
+		})
+	}
+
+	return ami.ManagerConfig{
+		Clients: clients,
+	}
 }
 
 // GetWebSocketReadTimeout returns the WebSocket read timeout as a duration

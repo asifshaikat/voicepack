@@ -1,391 +1,482 @@
-// pkg/sip/proxy.go
+// gateway/pkg/sip/proxy.go
 package sip
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log/slog"
 	"net"
+	"strconv"
 	"sync"
-	"time"
 
-	"github.com/jart/gosip/sip"
 	"go.uber.org/zap"
 
-	"gateway/pkg/common"
 	"gateway/pkg/rtpengine"
 	"gateway/pkg/storage"
+
+	"github.com/emiago/sipgo"
+	"github.com/emiago/sipgo/sip"
 )
 
-// Transport defines the interface for SIP transports
-type Transport interface {
-	Start(ctx context.Context) error
-	Stop() error
-	Send(msg sip.Message, addr net.Addr) error
-	SetHandler(handler TransportHandler)
+// ------------------------------
+// Internal Types and Helpers
+// ------------------------------
+
+// Registry provides a simple user -> address mapping in memory.
+type Registry struct {
+	mu    sync.RWMutex
+	store map[string]string
 }
 
-// TransportHandler handles incoming SIP messages
-type TransportHandler interface {
-	HandleMessage(msg sip.Message, addr net.Addr) error
+// NewRegistry creates a new registration store.
+func NewRegistry() *Registry {
+	return &Registry{
+		store: make(map[string]string),
+	}
 }
 
-// Proxy implements a stateful SIP proxy
-type Proxy struct {
-	config         ProxyConfig
-	transports     []Transport
-	storage        storage.StateStorage
-	rtpEngine      rtpengine.Manager
-	logger         *zap.Logger
-	registry       *common.GoroutineRegistry
-	requestHandler RequestHandler
-	circuitBreaker *common.CircuitBreaker
-
-	mu       sync.RWMutex
-	serverTx map[string]*sip.ServerTransaction
-	clientTx map[string]*sip.ClientTransaction
-	dialogs  map[string]*Dialog
+// Add registers a user to a given address.
+func (r *Registry) Add(user, addr string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.store[user] = addr
 }
 
-// ProxyConfig defines the configuration for the SIP proxy
-type ProxyConfig struct {
+// Get retrieves the address for a given user, or an empty string if none.
+func (r *Registry) Get(user string) string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.store[user]
+}
+
+// setupSipProxy builds a SIP proxy server that listens on the given ip
+// and forwards requests to proxydst if not found in the registry.
+func setupSipProxy(proxydst, ip string) (*sipgo.Server, *sipgo.Client, *Registry) {
+	// Use slog.Default() for simple logging.
+	log := slog.Default()
+	host, port, _ := sip.ParseAddr(ip)
+
+	// Build a user agent (UA)
+	ua, err := sipgo.NewUA()
+	if err != nil {
+		log.Error("Failed to create UA", "error", err)
+		return nil, nil, nil
+	}
+
+	// Create the main SIP server
+	srv, err := sipgo.NewServer(ua)
+	if err != nil {
+		log.Error("Failed to create server", "error", err)
+		return nil, nil, nil
+	}
+
+	// Create a SIP client (for forwarding requests downstream)
+	client, err := sipgo.NewClient(ua, sipgo.WithClientAddr(ip))
+	if err != nil {
+		log.Error("Failed to create client", "error", err)
+		return nil, nil, nil
+	}
+
+	registry := NewRegistry()
+
+	// getDestination returns the final host:port to proxy calls to.
+	var getDestination = func(req *sip.Request) string {
+		toHeader := req.To()
+		if toHeader == nil || toHeader.Address.Host == "" {
+			return proxydst
+		}
+		dst := registry.Get(toHeader.Address.User)
+		if dst == "" {
+			return proxydst
+		}
+		return dst
+	}
+
+	// reply sends a response with the provided code and reason.
+	var reply = func(tx sip.ServerTransaction, req *sip.Request, code int, reason string) {
+		resp := sip.NewResponseFromRequest(req, code, reason, nil)
+		resp.SetDestination(req.Source())
+		if err := tx.Respond(resp); err != nil {
+			log.Error("Failed to send response", "error", err)
+		}
+	}
+
+	// route handles generic forwarding logic.
+	var route = func(req *sip.Request, tx sip.ServerTransaction) {
+		dstAddr := getDestination(req)
+		if dstAddr == "" {
+			reply(tx, req, 404, "Not found")
+			return
+		}
+		ctx := context.Background()
+		req.SetDestination(dstAddr)
+		clTx, err := client.TransactionRequest(ctx, req,
+			sipgo.ClientRequestAddVia,
+			sipgo.ClientRequestAddRecordRoute,
+		)
+		if err != nil {
+			log.Error("Failed to create client transaction", "error", err)
+			reply(tx, req, 500, "")
+			return
+		}
+		defer clTx.Terminate()
+
+		log.Debug("Starting transaction", "method", req.Method.String())
+		for {
+			select {
+			case res, more := <-clTx.Responses():
+				if !more {
+					return
+				}
+				// Force the final destination to the original source.
+				res.SetDestination(req.Source())
+				// Remove the topmost Via header.
+				res.RemoveHeader("Via")
+				if err := tx.Respond(res); err != nil {
+					log.Error("Failed to forward response", "error", err)
+				}
+			case <-clTx.Done():
+				if err := clTx.Err(); err != nil {
+					log.Error("Client transaction ended with error", "error", err)
+				}
+				return
+			case ack := <-tx.Acks():
+				log.Info("Proxying ACK", "method", req.Method.String(), "dstAddr", dstAddr)
+				ack.SetDestination(dstAddr)
+				if wErr := client.WriteRequest(ack); wErr != nil {
+					log.Error("ACK forward failed", "error", wErr)
+				}
+			case <-tx.Done():
+				if err := tx.Err(); err != nil {
+					if errors.Is(err, sip.ErrTransactionCanceled) {
+						if req.IsInvite() {
+							r := newCancelRequest(req)
+							res, cErr := client.Do(ctx, r)
+							if cErr != nil {
+								log.Error("Canceling downstream transaction failed", "error", cErr)
+							} else if res.StatusCode != 200 {
+								log.Error("Downstream CANCEL returned non-200 code", "code", res.StatusCode)
+							}
+						}
+					} else {
+						log.Error("Server transaction ended with error", "error", err)
+					}
+				}
+				log.Debug("Transaction done", "method", req.Method.String())
+				return
+			}
+		}
+	}
+
+	srv.OnRegister(func(req *sip.Request, tx sip.ServerTransaction) {
+		contactHeader := req.Contact()
+		if contactHeader == nil || contactHeader.Address.Host == "" {
+			reply(tx, req, 404, "Missing address of record")
+			return
+		}
+		uri := contactHeader.Address
+		if uri.Host == host && uri.Port == port {
+			reply(tx, req, 401, "Contact address not provided")
+			return
+		}
+		addr := uri.Host + ":" + strconv.Itoa(uri.Port)
+		registry.Add(uri.User, addr)
+		log.Debug(fmt.Sprintf("Registered %s -> %s", uri.User, addr))
+		res := sip.NewResponseFromRequest(req, 200, "OK", nil)
+		uri.UriParams = sip.NewParams()
+		uri.UriParams.Add("transport", req.Transport())
+		if err := tx.Respond(res); err != nil {
+			log.Error("Failed to respond 200 to REGISTER", "error", err)
+		}
+	})
+
+	srv.OnInvite(func(req *sip.Request, tx sip.ServerTransaction) {
+		route(req, tx)
+	})
+
+	srv.OnAck(func(req *sip.Request, tx sip.ServerTransaction) {
+		dstAddr := getDestination(req)
+		if dstAddr == "" {
+			return
+		}
+		req.SetDestination(dstAddr)
+		if err := client.WriteRequest(req, sipgo.ClientRequestAddVia); err != nil {
+			log.Error("ACK forward failed", "error", err)
+			reply(tx, req, 500, "")
+		}
+	})
+
+	srv.OnCancel(func(req *sip.Request, tx sip.ServerTransaction) {
+		route(req, tx)
+	})
+
+	srv.OnBye(func(req *sip.Request, tx sip.ServerTransaction) {
+		route(req, tx)
+	})
+
+	return srv, client, registry
+}
+
+func newCancelRequest(inviteRequest *sip.Request) *sip.Request {
+	cancelReq := sip.NewRequest(sip.CANCEL, inviteRequest.Recipient)
+	cancelReq.AppendHeader(sip.HeaderClone(inviteRequest.Via()))
+	cancelReq.AppendHeader(sip.HeaderClone(inviteRequest.From()))
+	cancelReq.AppendHeader(sip.HeaderClone(inviteRequest.To()))
+	cancelReq.AppendHeader(sip.HeaderClone(inviteRequest.CallID()))
+	sip.CopyHeaders("Route", inviteRequest, cancelReq)
+	cancelReq.SetSource(inviteRequest.Source())
+	cancelReq.SetDestination(inviteRequest.Destination())
+	return cancelReq
+}
+
+// ------------------------------
+// Exported Types and Functions
+// ------------------------------
+
+// SIPConfig represents the SIP proxy configuration.
+type SIPConfig struct {
+	UDPBindAddr    string // e.g., "127.0.0.1:5060"
 	ProxyURI       string
 	DefaultNextHop string
 	MaxForwards    int
 	UserAgent      string
 }
 
-// RequestHandler defines the interface for custom SIP request handling
-type RequestHandler interface {
-	HandleRequest(req *sip.Request, tx *sip.ServerTransaction) error
+// Proxy wraps the underlying sipgo.Server and holds additional state.
+type Proxy struct {
+	server     *sipgo.Server
+	client     *sipgo.Client
+	registry   *Registry
+	logger     *zap.Logger
+	storage    storage.StateStorage
+	rtpEngine  *rtpengine.Manager
+	transports []Transport
+	proxyDst   string
 }
 
-// Dialog represents a SIP dialog
-type Dialog struct {
-	CallID     string
-	FromTag    string
-	ToTag      string
-	State      string
-	Route      []string
-	CreateTime time.Time
-	UpdateTime time.Time
-	ExpireTime time.Time
-}
-
-// NewProxy creates a new SIP proxy
-func NewProxy(config ProxyConfig, storage storage.StateStorage, rtpEngine rtpengine.Manager, logger *zap.Logger) (*Proxy, error) {
-	if logger == nil {
-		var err error
-		logger, err = zap.NewProduction()
-		if err != nil {
-			return nil, err
-		}
+// NewProxy creates a new SIP proxy instance based on the provided configuration.
+// The proxydst is taken from cfg.DefaultNextHop and the IP to bind from cfg.UDPBindAddr.
+func NewProxy(cfg SIPConfig, storage storage.StateStorage, rtpEngine *rtpengine.Manager, logger *zap.Logger) (*Proxy, error) {
+	srv, client, registry := setupSipProxy(cfg.DefaultNextHop, cfg.UDPBindAddr)
+	if srv == nil {
+		return nil, errors.New("failed to create SIP server")
 	}
-
-	// Set defaults
-	if config.MaxForwards <= 0 {
-		config.MaxForwards = 70
-	}
-
-	if config.UserAgent == "" {
-		config.UserAgent = "WebRTC-SIP Gateway"
-	}
-
-	p := &Proxy{
-		config:     config,
-		transports: make([]Transport, 0),
+	return &Proxy{
+		server:     srv,
+		client:     client,
+		registry:   registry,
+		logger:     logger,
 		storage:    storage,
 		rtpEngine:  rtpEngine,
-		logger:     logger,
-		registry:   common.NewGoroutineRegistry(logger),
-		serverTx:   make(map[string]*sip.ServerTransaction),
-		clientTx:   make(map[string]*sip.ClientTransaction),
-		dialogs:    make(map[string]*Dialog),
-		circuitBreaker: common.NewCircuitBreaker("sip-proxy", common.CircuitBreakerConfig{
-			FailureThreshold: 5,
-			ResetSeconds:     30,
-			HalfOpenMax:      3,
-		}, logger),
-	}
-
-	return p, nil
+		transports: make([]Transport, 0),
+		proxyDst:   cfg.DefaultNextHop,
+	}, nil
 }
 
-// AddTransport adds a SIP transport to the proxy
-func (p *Proxy) AddTransport(transport Transport) {
-	transport.SetHandler(p)
-	p.transports = append(p.transports, transport)
+// AddTransport adds a transport to the SIP proxy.
+func (p *Proxy) AddTransport(t Transport) {
+	p.transports = append(p.transports, t)
+	// Optionally, you can integrate this transport with the underlying server.
 }
 
-// SetRequestHandler sets a custom request handler
-func (p *Proxy) SetRequestHandler(handler RequestHandler) {
-	p.requestHandler = handler
-}
-
-// Start starts the proxy
+// Start starts the SIP proxy server.
 func (p *Proxy) Start(ctx context.Context) error {
-	if len(p.transports) == 0 {
-		return fmt.Errorf("no transports configured")
-	}
+	// Adjust parameters as needed. Here we assume UDP transport.
+	return p.server.ListenAndServe(ctx, "udp", "")
+}
 
-	// Start all transports
-	for _, transport := range p.transports {
-		if err := transport.Start(ctx); err != nil {
-			return fmt.Errorf("failed to start transport: %w", err)
+// Stop stops the SIP proxy server.
+func (p *Proxy) Stop() error {
+	return nil
+}
+
+// HandleMessage implements the websocket.SIPHandler interface to process SIP messages from WebSocket connections
+// HandleMessage implements the websocket.SIPHandler interface for processing SIP messages
+func (p *Proxy) HandleMessage(msg Message, addr net.Addr) error {
+	clientAddr := addr.String()
+
+	// No need to parse the message as it's already parsed
+
+	// Process based on message type
+	if req, ok := msg.(*Request); ok {
+		// Handle different request types
+		switch req.Method.String() {
+		case "REGISTER":
+			return p.handleRegister(req, clientAddr)
+		case "INVITE":
+			return p.handleInvite(req, clientAddr)
+		case "BYE":
+			return p.handleBye(req, clientAddr)
+		case "ACK":
+			return p.handleAck(req, clientAddr)
+		case "CANCEL":
+			return p.handleCancel(req, clientAddr)
+		case "OPTIONS":
+			return p.handleOptions(req, clientAddr)
+		default:
+			p.logger.Debug("Unhandled SIP method",
+				zap.String("method", req.Method.String()),
+				zap.String("client", clientAddr))
 		}
+	} else if resp, ok := msg.(*Response); ok {
+		// Handle SIP responses
+		return p.handleResponse(resp, clientAddr)
 	}
-
-	// Start dialog cleanup
-	p.registry.Go("dialog-cleanup", func(ctx context.Context) {
-		ticker := time.NewTicker(5 * time.Minute)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				p.cleanupDialogs()
-			}
-		}
-	})
 
 	return nil
 }
 
-// Stop stops the proxy
-func (p *Proxy) Stop() error {
-	// Stop all transports
-	for _, transport := range p.transports {
-		if err := transport.Stop(); err != nil {
-			p.logger.Error("Failed to stop transport", zap.Error(err))
-		}
+// Helper methods with the proper signature
+
+func (p *Proxy) handleRegister(req *Request, clientAddr string) error {
+	contactHeader := req.Contact()
+	if contactHeader == nil || contactHeader.Address.Host == "" {
+		p.logger.Error("Missing address of record in REGISTER",
+			zap.String("client", clientAddr))
+		return errors.New("missing address of record")
 	}
 
-	// Stop goroutines
-	return p.registry.Shutdown(30 * time.Second)
+	uri := contactHeader.Address
+	host, port, _ := net.SplitHostPort(clientAddr)
+	portNum, _ := strconv.Atoi(port)
+
+	if uri.Host == host && uri.Port == portNum {
+		p.logger.Error("Contact address not provided in REGISTER",
+			zap.String("client", clientAddr))
+		return errors.New("contact address not provided")
+	}
+
+	addr := uri.Host + ":" + strconv.Itoa(uri.Port)
+	p.registry.Add(uri.User, addr)
+	p.logger.Debug("Registered user via WebSocket",
+		zap.String("user", uri.User),
+		zap.String("address", addr))
+
+	// Forward to server if needed
+	return p.forwardRequest(req, clientAddr)
 }
 
-// HandleMessage implements TransportHandler
-func (p *Proxy) HandleMessage(msg sip.Message, addr net.Addr) error {
-	switch m := msg.(type) {
-	case *sip.Request:
-		return p.handleRequest(m, addr)
-	case *sip.Response:
-		return p.handleResponse(m, addr)
-	default:
-		return fmt.Errorf("unknown message type")
-	}
+func (p *Proxy) handleInvite(req *Request, clientAddr string) error {
+	return p.forwardRequest(req, clientAddr)
 }
 
-// handleRequest processes SIP requests
-func (p *Proxy) handleRequest(req *sip.Request, addr net.Addr) error {
-	if !p.circuitBreaker.AllowRequest() {
-		p.logger.Warn("Circuit breaker open, rejecting request",
-			zap.String("method", string(req.Method)),
-			zap.String("callID", req.CallID().Value))
-		// Send 503 Service Unavailable
-		resp := sip.NewResponse(sip.StatusServiceUnavailable, "Service Unavailable")
-		resp.SetDestination(addr)
-		// Add Retry-After header
-		resp.AppendHeader(&sip.RetryAfterHeader{
-			Value: "10",
-		})
-		for _, transport := range p.transports {
-			if err := transport.Send(resp, addr); err != nil {
-				p.logger.Error("Failed to send 503 response", zap.Error(err))
-			}
-		}
-		return nil
+func (p *Proxy) handleBye(req *Request, clientAddr string) error {
+	return p.forwardRequest(req, clientAddr)
+}
+
+func (p *Proxy) handleAck(req *Request, clientAddr string) error {
+	return p.forwardRequest(req, clientAddr)
+}
+
+func (p *Proxy) handleCancel(req *Request, clientAddr string) error {
+	return p.forwardRequest(req, clientAddr)
+}
+
+func (p *Proxy) handleOptions(req *Request, clientAddr string) error {
+	return p.forwardRequest(req, clientAddr)
+}
+
+func (p *Proxy) handleResponse(resp *Response, clientAddr string) error {
+	// Process SIP responses if needed
+	p.logger.Debug("Received SIP response via WebSocket",
+		zap.Int("status", resp.StatusCode),
+		zap.String("client", clientAddr))
+
+	// Forward response if needed
+	return nil
+}
+
+func (p *Proxy) forwardRequest(req *Request, clientAddr string) error {
+	// Determine destination
+	dstAddr := p.getDestination(req)
+	if dstAddr == "" {
+		p.logger.Error("No destination found for request",
+			zap.String("method", req.Method.String()),
+			zap.String("client", clientAddr))
+		return errors.New("no destination found")
 	}
 
-	// Create server transaction
-	branchID := req.Via().Params.Get("branch")
-	callID := req.CallID().Value
-	txKey := fmt.Sprintf("%s:%s", branchID, callID)
+	req.SetDestination(dstAddr)
 
-	// Create server transaction if it doesn't exist
-	p.mu.Lock()
-	tx, exists := p.serverTx[txKey]
-	if !exists {
-		tx = sip.NewServerTransaction(req)
-		p.serverTx[txKey] = tx
-	}
-	p.mu.Unlock()
+	// Create context for the request
+	ctx := context.Background()
 
-	// Process the request
-	var err error
-
-	// If we have a custom handler, use it
-	if p.requestHandler != nil {
-		err = p.requestHandler.HandleRequest(req, tx)
-	} else {
-		// Default handling based on method
-		switch req.Method {
-		case sip.INVITE:
-			err = p.handleInvite(req, tx)
-		case sip.ACK:
-			err = p.handleAck(req, tx)
-		case sip.BYE:
-			err = p.handleBye(req, tx)
-		case sip.CANCEL:
-			err = p.handleCancel(req, tx)
-		case sip.REGISTER:
-			err = p.handleRegister(req, tx)
-		case sip.OPTIONS:
-			err = p.handleOptions(req, tx)
-		default:
-			err = p.handleDefault(req, tx)
-		}
-	}
-
+	// Forward the request using the client
+	clTx, err := p.client.TransactionRequest(ctx, req,
+		sipgo.ClientRequestAddVia,
+		sipgo.ClientRequestAddRecordRoute,
+	)
 	if err != nil {
-		p.logger.Error("Failed to handle request",
-			zap.String("method", string(req.Method)),
-			zap.Error(err))
-
-		p.circuitBreaker.RecordFailure()
-
-		// Send 500 Internal Server Error
-		resp := sip.NewResponse(sip.StatusInternalServerError, "Internal Server Error")
-		resp.SetDestination(addr)
-		for _, transport := range p.transports {
-			if err := transport.Send(resp, addr); err != nil {
-				p.logger.Error("Failed to send 500 response", zap.Error(err))
-			}
-		}
+		p.logger.Error("Failed to create client transaction for WebSocket request",
+			zap.Error(err),
+			zap.String("client", clientAddr))
 		return err
 	}
+	defer clTx.Terminate()
 
-	p.circuitBreaker.RecordSuccess()
+	p.logger.Debug("Forwarded WebSocket SIP request",
+		zap.String("method", req.Method.String()),
+		zap.String("client", clientAddr),
+		zap.String("destination", dstAddr))
+
+	// Could handle responses here, but that would require a mechanism to
+	// send responses back via WebSocket to the original sender
 	return nil
 }
-
-// handleInvite processes SIP INVITE requests
-func (p *Proxy) handleInvite(req *sip.Request, tx *sip.ServerTransaction) error {
-	callID := req.CallID().Value
-	fromTag := req.From().Tag
-
-	// Extract the SDP
-	sdp := extractSDP(req)
-
-	// Process with RTPEngine if we have SDP
-	if sdp != "" {
-		// Determine if this is from WebRTC
-		fromWebRTC := isFromWebRTC(req)
-
-		// Prepare options
-		options := make(map[string]interface{})
-		if fromWebRTC {
-			options["ICE"] = "force"
-			options["DTLS"] = "passive"
-		}
-
-		// Process with RTPEngine
-		ctx := context.Background()
-		newSDP, err := p.rtpEngine.ProcessOffer(ctx, callID, fromTag, sdp, options)
-		if err != nil {
-			p.logger.Error("Failed to process SDP offer",
-				zap.String("callID", callID),
-				zap.Error(err))
-			return err
-		}
-
-		// Replace the SDP
-		replaceSDP(req, newSDP)
+func (p *Proxy) getDestination(req *sip.Request) string {
+	toHeader := req.To()
+	if toHeader == nil || toHeader.Address.Host == "" {
+		return p.proxyDst
 	}
-
-	// Store dialog state
-	dialog := &Dialog{
-		CallID:     callID,
-		FromTag:    fromTag,
-		State:      "early",
-		CreateTime: time.Now(),
-		UpdateTime: time.Now(),
-		ExpireTime: time.Now().Add(24 * time.Hour),
+	dst := p.registry.Get(toHeader.Address.User)
+	if dst == "" {
+		return p.proxyDst
 	}
+	return dst
+}
 
-	ctx := context.Background()
-	if err := p.storage.StoreDialog(ctx, dialog); err != nil {
-		p.logger.Error("Failed to store dialog",
-			zap.String("callID", callID),
-			zap.Error(err))
+// Transport defines an interface for sending SIP messages.
+type Transport interface {
+	Send(msg sip.Message, addr net.Addr) error
+}
+
+// UDPTransport is a minimal implementation of a UDP transport.
+type UDPTransport struct {
+	bindAddr string
+	logger   *zap.Logger
+	conn     *net.UDPConn
+}
+
+// NewUDPTransportImpl creates a new UDPTransport.
+func NewUDPTransportImpl(bindAddr string, logger *zap.Logger) (*UDPTransport, error) {
+	udpAddr, err := net.ResolveUDPAddr("udp", bindAddr)
+	if err != nil {
+		return nil, err
 	}
-
-	// Store in memory as well
-	p.mu.Lock()
-	p.dialogs[callID] = dialog
-	p.mu.Unlock()
-
-	// Add Record-Route header
-	req.AppendHeader(&sip.RecordRouteHeader{
-		Address: sip.URI{Host: p.config.ProxyURI},
-	})
-
-	// Forward the request to the next hop
-	return p.forwardRequest(req, tx)
-}
-
-// Additional methods for handling other SIP requests...
-
-// handleResponse processes SIP responses
-func (p *Proxy) handleResponse(resp *sip.Response, addr net.Addr) error {
-	// Process the response
-	return nil
-}
-
-// forwardRequest forwards a SIP request to the next hop
-func (p *Proxy) forwardRequest(ctx context.Context, req *sip.Request, tx *sip.ServerTransaction) error {
-	ctx, cancel := common.ContextWithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	// Determine next hop
-	nextHop := p.determineNextHop(req)
-
-	// Create client transaction
-	clientTx := sip.NewClientTransaction(req)
-
-	// Store transaction mapping
-	branchID := req.Via().Params.Get("branch")
-	callID := req.CallID().Value
-	txKey := fmt.Sprintf("%s:%s", branchID, callID)
-
-	p.mu.Lock()
-	p.clientTx[txKey] = clientTx
-	p.mu.Unlock()
-
-	// Forward the request
-	req.SetDestination(nextHop)
-
-	// Send the request via the appropriate transport
-	for _, transport := range p.transports {
-		if err := transport.Send(req, nextHop); err != nil {
-			p.logger.Error("Failed to forward request",
-				zap.String("method", string(req.Method)),
-				zap.String("nextHop", nextHop.String()),
-				zap.Error(err))
-			return err
-		}
+	conn, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		return nil, err
 	}
-
-	return nil
+	return &UDPTransport{
+		bindAddr: bindAddr,
+		logger:   logger,
+		conn:     conn,
+	}, nil
 }
 
-// determineNextHop finds the next hop for a request
-func (p *Proxy) determineNextHop(req *sip.Request) net.Addr {
-	// Implementation depends on your routing logic
-	return nil // Placeholder
+// Send sends a SIP message over UDP.
+func (t *UDPTransport) Send(msg sip.Message, addr net.Addr) error {
+	data := []byte(msg.String())
+	udpAddr, ok := addr.(*net.UDPAddr)
+	if !ok {
+		return errors.New("invalid UDP address")
+	}
+	_, err := t.conn.WriteToUDP(data, udpAddr)
+	return err
 }
 
-// Helper functions
-func extractSDP(req *sip.Request) string {
-	// Extract SDP from request
-	return "" // Placeholder
-}
-
-func replaceSDP(req *sip.Request, newSDP string) {
-	// Replace SDP in request
-}
-
-func isFromWebRTC(req *sip.Request) bool {
-	// Determine if request is from WebRTC client
-	return false // Placeholder
+// NewUDPTransport creates a new UDP transport and returns it as a Transport interface.
+func NewUDPTransport(bindAddr string, logger *zap.Logger) (Transport, error) {
+	return NewUDPTransportImpl(bindAddr, logger)
 }

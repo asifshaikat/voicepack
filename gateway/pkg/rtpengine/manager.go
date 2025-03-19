@@ -12,6 +12,7 @@ import (
 	"go.uber.org/zap"
 
 	"gateway/pkg/common"
+	"gateway/pkg/coordinator"
 	"gateway/pkg/storage"
 )
 
@@ -32,7 +33,7 @@ type ManagerConfig struct {
 }
 
 // NewManager creates a new RTPEngine manager
-func NewManager(config ManagerConfig, logger *zap.Logger, registry *common.GoroutineRegistry, storage storage.StateStorage, coordinator *common.Coordinator) (*Manager, error)  {
+func NewManager(config ManagerConfig, logger *zap.Logger, registry *common.GoroutineRegistry, storage storage.StateStorage, coordinator *coordinator.Coordinator) (*Manager, error) {
 	if logger == nil {
 		var err error
 		logger, err = zap.NewProduction()
@@ -146,7 +147,7 @@ func (m *Manager) GetEngine(ctx context.Context, callID string) (*RTPEngine, err
 // ProcessOffer processes an SDP offer through RTPEngine
 func (m *Manager) ProcessOffer(ctx context.Context, callID, fromTag string, sdp string, options map[string]interface{}) (string, error) {
 	ctx, cancel := common.ContextWithTimeout(ctx, 5*time.Second)
-    defer cancel()
+	defer cancel()
 	// Create base parameters
 	params := map[string]interface{}{
 		"call-id":  callID,
@@ -207,7 +208,7 @@ func (m *Manager) ProcessOffer(ctx context.Context, callID, fromTag string, sdp 
 // ProcessAnswer processes an SDP answer through RTPEngine
 func (m *Manager) ProcessAnswer(ctx context.Context, callID, fromTag, toTag string, sdp string, options map[string]interface{}) (string, error) {
 	ctx, cancel := common.ContextWithTimeout(ctx, 5*time.Second)
-    defer cancel()
+	defer cancel()
 	// Create base parameters
 	params := map[string]interface{}{
 		"call-id":  callID,
@@ -260,7 +261,7 @@ func (m *Manager) ProcessAnswer(ctx context.Context, callID, fromTag, toTag stri
 // DeleteSession deletes a session from RTPEngine
 func (m *Manager) DeleteSession(ctx context.Context, callID string) error {
 	ctx, cancel := common.ContextWithTimeout(ctx, 5*time.Second)
-    defer cancel()
+	defer cancel()
 	// Get the appropriate engine
 	engine, err := m.GetEngine(ctx, callID)
 	if err != nil {
@@ -294,7 +295,7 @@ func (m *Manager) DeleteSession(ctx context.Context, callID string) error {
 // failoverOffer attempts to send an offer to an alternative RTPEngine
 func (m *Manager) failoverOffer(ctx context.Context, callID, fromTag string, sdp string, options map[string]interface{}) (string, error) {
 	ctx, cancel := common.ContextWithTimeout(ctx, 5*time.Second)
-    defer cancel()
+	defer cancel()
 	currentIdx := atomic.LoadInt32(&m.activeIdx)
 
 	// Try each engine in turn
@@ -330,14 +331,14 @@ func (m *Manager) failoverOffer(ctx context.Context, callID, fromTag string, sdp
 
 		// Success - update active engine
 		// Start a background task to migrate active calls from the old engine to the new one
-		
+
 		atomic.StoreInt32(&m.activeIdx, int32(idx))
-		
+
 		go func(oldIdx, newIdx int) {
 			// Create a background context for migration
 			bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 			defer cancel()
-			
+
 			// Migrate active calls
 			if err := m.MigrateActiveCalls(bgCtx, oldIdx, newIdx); err != nil {
 				m.logger.Error("Failed to migrate active calls",
@@ -376,7 +377,7 @@ func (m *Manager) failoverOffer(ctx context.Context, callID, fromTag string, sdp
 // failoverAnswer attempts to send an answer to an alternative RTPEngine
 func (m *Manager) failoverAnswer(ctx context.Context, callID, fromTag, toTag string, sdp string, options map[string]interface{}) (string, error) {
 	ctx, cancel := common.ContextWithTimeout(ctx, 5*time.Second)
-    defer cancel()
+	defer cancel()
 	currentIdx := atomic.LoadInt32(&m.activeIdx)
 
 	// Try each engine in turn
@@ -444,7 +445,7 @@ func (m *Manager) failoverAnswer(ctx context.Context, callID, fromTag, toTag str
 // failoverDelete attempts to delete a session on an alternative RTPEngine
 func (m *Manager) failoverDelete(ctx context.Context, callID string) error {
 	ctx, cancel := common.ContextWithTimeout(ctx, 5*time.Second)
-    defer cancel()
+	defer cancel()
 	currentIdx := atomic.LoadInt32(&m.activeIdx)
 
 	// Try each engine in turn
@@ -484,244 +485,245 @@ func (m *Manager) failoverDelete(ctx context.Context, callID string) error {
 
 		return nil
 	}
+
+	return fmt.Errorf("all RTPEngine instances failed")
+}
+
 // MigrateActiveCalls moves active media sessions from one RTPEngine to another
 func (m *Manager) MigrateActiveCalls(ctx context.Context, fromIdx, toIdx int) error {
-    if fromIdx < 0 || fromIdx >= len(m.engines) || toIdx < 0 || toIdx >= len(m.engines) {
-        return fmt.Errorf("invalid engine indices: from=%d, to=%d", fromIdx, toIdx)
-    }
-    
-    if fromIdx == toIdx {
-        return nil // Nothing to do
-    }
-    
-    fromEngine := m.engines[fromIdx]
-    toEngine := m.engines[toIdx]
-    
-    m.logger.Info("Starting migration of active calls",
-        zap.String("fromEngine", fmt.Sprintf("%s:%d", fromEngine.address, fromEngine.port)),
-        zap.String("toEngine", fmt.Sprintf("%s:%d", toEngine.address, toEngine.port)))
-    
-    // Get all active sessions
-    sessions, err := m.storage.ListRTPSessions(ctx)
-    if err != nil {
-        m.logger.Error("Failed to list RTP sessions", zap.Error(err))
-        return err
-    }
-    
-    var migrationCount int
-    var errorCount int
-    
-    // Create a worker pool for parallel migration
-    const workerCount = 10
-    var wg sync.WaitGroup
-    sessionCh := make(chan *storage.RTPSession, len(sessions))
-    resultCh := make(chan struct {
-        callID string
-        err    error
-    }, len(sessions))
-    
-    // Start worker goroutines
-    for i := 0; i < workerCount; i++ {
-        wg.Add(1)
-        go func() {
-            defer wg.Done()
-            for session := range sessionCh {
-                // Skip sessions that aren't on the source engine
-                if session.EngineIdx != fromIdx {
-                    continue
-                }
-                
-                err := m.migrateSession(ctx, session, toEngine, toIdx)
-                resultCh <- struct {
-                    callID string
-                    err    error
-                }{session.CallID, err}
-            }
-        }()
-    }
-    
-    // Feed sessions to workers
-    for _, session := range sessions {
-        sessionCh <- session
-    }
-    close(sessionCh)
-    
-    // Wait for workers and collect results
-    go func() {
-        wg.Wait()
-        close(resultCh)
-    }()
-    
-    // Process results
-    for result := range resultCh {
-        if result.err != nil {
-            m.logger.Error("Failed to migrate RTP session",
-                zap.String("callID", result.callID),
-                zap.Error(result.err))
-            errorCount++
-        } else {
-            migrationCount++
-        }
-    }
-    
-    m.logger.Info("RTP session migration completed",
-        zap.Int("total", len(sessions)),
-        zap.Int("migrated", migrationCount),
-        zap.Int("errors", errorCount))
-    
-    if errorCount > 0 {
-        return fmt.Errorf("failed to migrate %d/%d sessions", errorCount, len(sessions))
-    }
-    
-    return nil
+	if fromIdx < 0 || fromIdx >= len(m.engines) || toIdx < 0 || toIdx >= len(m.engines) {
+		return fmt.Errorf("invalid engine indices: from=%d, to=%d", fromIdx, toIdx)
+	}
+
+	if fromIdx == toIdx {
+		return nil // Nothing to do
+	}
+
+	fromEngine := m.engines[fromIdx]
+	toEngine := m.engines[toIdx]
+
+	m.logger.Info("Starting migration of active calls",
+		zap.String("fromEngine", fmt.Sprintf("%s:%d", fromEngine.address, fromEngine.port)),
+		zap.String("toEngine", fmt.Sprintf("%s:%d", toEngine.address, toEngine.port)))
+
+	// Get all active sessions
+	sessions, err := m.storage.ListRTPSessions(ctx)
+	if err != nil {
+		m.logger.Error("Failed to list RTP sessions", zap.Error(err))
+		return err
+	}
+
+	var migrationCount int
+	var errorCount int
+
+	// Create a worker pool for parallel migration
+	const workerCount = 10
+	var wg sync.WaitGroup
+	sessionCh := make(chan *storage.RTPSession, len(sessions))
+	resultCh := make(chan struct {
+		callID string
+		err    error
+	}, len(sessions))
+
+	// Start worker goroutines
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for session := range sessionCh {
+				// Skip sessions that aren't on the source engine
+				if session.EngineIdx != fromIdx {
+					continue
+				}
+
+				err := m.migrateSession(ctx, session, toEngine, toIdx)
+				resultCh <- struct {
+					callID string
+					err    error
+				}{session.CallID, err}
+			}
+		}()
+	}
+
+	// Feed sessions to workers
+	for _, session := range sessions {
+		sessionCh <- session
+	}
+	close(sessionCh)
+
+	// Wait for workers and collect results
+	go func() {
+		wg.Wait()
+		close(resultCh)
+	}()
+
+	// Process results
+	for result := range resultCh {
+		if result.err != nil {
+			m.logger.Error("Failed to migrate RTP session",
+				zap.String("callID", result.callID),
+				zap.Error(result.err))
+			errorCount++
+		} else {
+			migrationCount++
+		}
+	}
+
+	m.logger.Info("RTP session migration completed",
+		zap.Int("total", len(sessions)),
+		zap.Int("migrated", migrationCount),
+		zap.Int("errors", errorCount))
+
+	if errorCount > 0 {
+		return fmt.Errorf("failed to migrate %d/%d sessions", errorCount, len(sessions))
+	}
+
+	return nil
 }
 
 // migrateSession migrates a single RTP session from one engine to another
-func (m *Manager) migrateSession(ctx context.Context, session *storage.RTPSession, 
-    toEngine *RTPEngine, toIdx int) error {
-    
-    callID := session.CallID
-    fromTag := session.FromTag
-    toTag := session.ToTag
-    
-    m.logger.Debug("Migrating session",
-        zap.String("callID", callID),
-        zap.String("fromTag", fromTag),
-        zap.String("toTag", toTag))
-    
-    // Step 1: Query call details from source engine
-    params := map[string]interface{}{
-        "call-id": callID,
-    }
-    
-    if fromTag != "" {
-        params["from-tag"] = fromTag
-    }
-    
-    if toTag != "" {
-        params["to-tag"] = toTag
-    }
-    
-    // Get the source engine
-    sourceEngine := m.engines[session.EngineIdx]
-    
-    // Query the call details
-    queryResult, err := sourceEngine.Query(ctx, params)
-    if err != nil {
-        return fmt.Errorf("failed to query source engine: %w", err)
-    }
-    
-    // Check if the call still exists
-    if result, ok := queryResult["result"].(string); !ok || result != "ok" {
-        // Call no longer exists, update storage and return
-        session.EngineIdx = toIdx
-        session.EngineAddr = fmt.Sprintf("%s:%d", toEngine.address, toEngine.port)
-        session.Updated = time.Now()
-        m.storage.StoreRTPSession(ctx, session)
-        return nil
-    }
-    
-    // Step 2: Create call on destination engine with similar parameters
-    // We need to create a new offer with the same parameters
-    // First, let's create options based on detected media
-    options := make(map[string]interface{})
-    
-    // Determine if WebRTC is being used
-    totals, ok := queryResult["totals"].(map[string]interface{})
-    if ok {
-        if _, hasICE := totals["DTLS"]; hasICE {
-            options["ICE"] = "force"
-            options["DTLS"] = "passive"
-        }
-    }
-    
-    // Add SDP from the query if available
-    sdpOffer := ""
-    if sdp, ok := queryResult["sdp-a"].(string); ok && sdp != "" {
-        sdpOffer = sdp
-    } else if sdp, ok := queryResult["sdp-b"].(string); ok && sdp != "" {
-        sdpOffer = sdp
-    }
-    
-    if sdpOffer == "" {
-        return fmt.Errorf("no SDP available for migration")
-    }
-    
-    // Create the call on the destination engine
-    newParams := map[string]interface{}{
-        "call-id":  callID,
-        "from-tag": fromTag,
-        "sdp":      sdpOffer,
-        "replace": "origin,session-connection",
-        "label": "migrated",
-    }
-    
-    // Add any additional options
-    for k, v := range options {
-        newParams[k] = v
-    }
-    
-    // Send the offer to new engine
-    offerResult, err := toEngine.Offer(ctx, newParams)
-    if err != nil {
-        return fmt.Errorf("failed to create offer on destination engine: %w", err)
-    }
-    
-    // Check for success
-    if result, ok := offerResult["result"].(string); !ok || result != "ok" {
-        return fmt.Errorf("offer creation failed on destination engine")
-    }
-    
-    // If we have a to-tag, send an answer as well
-    if toTag != "" {
-        answerSDP := ""
-        if sdp, ok := queryResult["sdp-b"].(string); ok && sdp != "" {
-            answerSDP = sdp
-        } else if sdp, ok := queryResult["sdp-a"].(string); ok && sdp != "" {
-            answerSDP = sdp
-        }
-        
-        if answerSDP != "" {
-            answerParams := map[string]interface{}{
-                "call-id":  callID,
-                "from-tag": fromTag,
-                "to-tag":   toTag,
-                "sdp":      answerSDP,
-                "replace": "origin,session-connection",
-                "label": "migrated",
-            }
-            
-            // Add any additional options
-            for k, v := range options {
-                answerParams[k] = v
-            }
-            
-            // Send the answer to new engine
-            _, err := toEngine.Answer(ctx, answerParams)
-            if err != nil {
-                // Try to clean up the call on destination
-                toEngine.Delete(ctx, map[string]interface{}{"call-id": callID})
-                return fmt.Errorf("failed to create answer on destination engine: %w", err)
-            }
-        }
-    }
-    
-    // Step 3: Update session in storage
-    session.EngineIdx = toIdx
-    session.EngineAddr = fmt.Sprintf("%s:%d", toEngine.address, toEngine.port)
-    session.Updated = time.Now()
-    m.storage.StoreRTPSession(ctx, session)
-    
-    // Step 4: Delete the call on the source engine after a delay
-    // This gives time for media to switch over
-    time.AfterFunc(500*time.Millisecond, func() {
-        deleteCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-        defer cancel()
-        
-        sourceEngine.Delete(deleteCtx, map[string]interface{}{"call-id": callID})
-    })
-    
-    return nil
-}
+func (m *Manager) migrateSession(ctx context.Context, session *storage.RTPSession, toEngine *RTPEngine, toIdx int) error {
+
+	callID := session.CallID
+	fromTag := session.FromTag
+	toTag := session.ToTag
+
+	m.logger.Debug("Migrating session",
+		zap.String("callID", callID),
+		zap.String("fromTag", fromTag),
+		zap.String("toTag", toTag))
+
+	// Step 1: Query call details from source engine
+	params := map[string]interface{}{
+		"call-id": callID,
+	}
+
+	if fromTag != "" {
+		params["from-tag"] = fromTag
+	}
+
+	if toTag != "" {
+		params["to-tag"] = toTag
+	}
+
+	// Get the source engine
+	sourceEngine := m.engines[session.EngineIdx]
+
+	// Query the call details
+	queryResult, err := sourceEngine.Query(ctx, params)
+	if err != nil {
+		return fmt.Errorf("failed to query source engine: %w", err)
+	}
+
+	// Check if the call still exists
+	if result, ok := queryResult["result"].(string); !ok || result != "ok" {
+		// Call no longer exists, update storage and return
+		session.EngineIdx = toIdx
+		session.EngineAddr = fmt.Sprintf("%s:%d", toEngine.address, toEngine.port)
+		session.Updated = time.Now()
+		m.storage.StoreRTPSession(ctx, session)
+		return nil
+	}
+
+	// Step 2: Create call on destination engine with similar parameters
+	// We need to create a new offer with the same parameters
+	// First, let's create options based on detected media
+	options := make(map[string]interface{})
+
+	// Determine if WebRTC is being used
+	totals, ok := queryResult["totals"].(map[string]interface{})
+	if ok {
+		if _, hasICE := totals["DTLS"]; hasICE {
+			options["ICE"] = "force"
+			options["DTLS"] = "passive"
+		}
+	}
+
+	// Add SDP from the query if available
+	sdpOffer := ""
+	if sdp, ok := queryResult["sdp-a"].(string); ok && sdp != "" {
+		sdpOffer = sdp
+	} else if sdp, ok := queryResult["sdp-b"].(string); ok && sdp != "" {
+		sdpOffer = sdp
+	}
+
+	if sdpOffer == "" {
+		return fmt.Errorf("no SDP available for migration")
+	}
+
+	// Create the call on the destination engine
+	newParams := map[string]interface{}{
+		"call-id":  callID,
+		"from-tag": fromTag,
+		"sdp":      sdpOffer,
+		"replace":  "origin,session-connection",
+		"label":    "migrated",
+	}
+
+	// Add any additional options
+	for k, v := range options {
+		newParams[k] = v
+	}
+
+	// Send the offer to new engine
+	offerResult, err := toEngine.Offer(ctx, newParams)
+	if err != nil {
+		return fmt.Errorf("failed to create offer on destination engine: %w", err)
+	}
+
+	// Check for success
+	if result, ok := offerResult["result"].(string); !ok || result != "ok" {
+		return fmt.Errorf("offer creation failed on destination engine")
+	}
+
+	// If we have a to-tag, send an answer as well
+	if toTag != "" {
+		answerSDP := ""
+		if sdp, ok := queryResult["sdp-b"].(string); ok && sdp != "" {
+			answerSDP = sdp
+		} else if sdp, ok := queryResult["sdp-a"].(string); ok && sdp != "" {
+			answerSDP = sdp
+		}
+
+		if answerSDP != "" {
+			answerParams := map[string]interface{}{
+				"call-id":  callID,
+				"from-tag": fromTag,
+				"to-tag":   toTag,
+				"sdp":      answerSDP,
+				"replace":  "origin,session-connection",
+				"label":    "migrated",
+			}
+
+			// Add any additional options
+			for k, v := range options {
+				answerParams[k] = v
+			}
+
+			// Send the answer to new engine
+			_, err := toEngine.Answer(ctx, answerParams)
+			if err != nil {
+				// Try to clean up the call on destination
+				toEngine.Delete(ctx, map[string]interface{}{"call-id": callID})
+				return fmt.Errorf("failed to create answer on destination engine: %w", err)
+			}
+		}
+	}
+
+	// Step 3: Update session in storage
+	session.EngineIdx = toIdx
+	session.EngineAddr = fmt.Sprintf("%s:%d", toEngine.address, toEngine.port)
+	session.Updated = time.Now()
+	m.storage.StoreRTPSession(ctx, session)
+
+	// Step 4: Delete the call on the source engine after a delay
+	// This gives time for media to switch over
+	time.AfterFunc(500*time.Millisecond, func() {
+		deleteCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		sourceEngine.Delete(deleteCtx, map[string]interface{}{"call-id": callID})
+	})
+
 	return fmt.Errorf("all RTPEngine instances failed")
 }

@@ -1,4 +1,4 @@
-// pkg/common/coordination.go
+// pkg/coordinator/coordination.go
 package coordinator
 
 import (
@@ -12,6 +12,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"gateway/pkg/common" // Add this import for GoroutineRegistry
 	"gateway/pkg/storage"
 )
 
@@ -20,7 +21,7 @@ type Coordinator struct {
 	instanceID      string
 	storage         storage.StateStorage
 	logger          *zap.Logger
-	registry        *GoroutineRegistry
+	registry        *common.GoroutineRegistry // Update to use common package
 	leaderLock      sync.RWMutex
 	isLeader        bool
 	leaseExpiration time.Time
@@ -76,7 +77,7 @@ func NewCoordinator(storage storage.StateStorage, config CoordinatorConfig, logg
 		instanceID:        instanceID,
 		storage:           storage,
 		logger:            logger,
-		registry:          NewGoroutineRegistry(logger),
+		registry:          common.NewGoroutineRegistry(logger), // Update to use common package
 		leadership:        make(map[string]bool),
 		leadershipCh:      make(chan string, 10),
 		heartbeatInterval: config.HeartbeatInterval,

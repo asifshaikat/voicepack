@@ -12,17 +12,19 @@ import (
 	"go.uber.org/zap"
 
 	"gateway/pkg/common"
+	"gateway/pkg/coordinator"
 	"gateway/pkg/storage"
 )
 
 // Manager handles multiple AMI clients with failover
 type Manager struct {
-	clients   []*AMIClient
-	activeIdx int32
-	mu        sync.RWMutex
-	logger    *zap.Logger
-	registry  *common.GoroutineRegistry
-	storage   storage.StateStorage
+	clients     []*AMIClient
+	activeIdx   int32
+	mu          sync.RWMutex
+	logger      *zap.Logger
+	registry    *common.GoroutineRegistry
+	storage     storage.StateStorage
+	coordinator *coordinator.Coordinator
 }
 
 // ManagerConfig holds the configuration for the AMI manager
@@ -31,7 +33,8 @@ type ManagerConfig struct {
 }
 
 // NewManager creates a new AMI manager
-func NewManager(config ManagerConfig, logger *zap.Logger, registry *common.GoroutineRegistry, storage storage.StateStorage, coordinator *common.Coordinator) (*Manager, error) {
+func NewManager(config ManagerConfig, logger *zap.Logger, registry *common.GoroutineRegistry,
+	storage storage.StateStorage, coord *coordinator.Coordinator) (*Manager, error) {
 	if logger == nil {
 		var err error
 		logger, err = zap.NewProduction()
@@ -63,10 +66,11 @@ func NewManager(config ManagerConfig, logger *zap.Logger, registry *common.Gorou
 	}
 
 	return &Manager{
-		clients:  clients,
-		logger:   logger,
-		registry: registry,
-		storage:  storage,
+		clients:     clients,
+		logger:      logger,
+		registry:    registry,
+		storage:     storage,
+		coordinator: coord, // Store the passed coordinator
 	}, nil
 }
 
@@ -320,10 +324,9 @@ func (m *Manager) GetActiveClient() *AMIClient {
 }
 
 // SendAction sends an action to the active AMI client with failover
-func (m *Manager) SendAction(ctx context.Context, action map[string]string) (map[string]string, error) {
-	// Create context with timeout
-	ctx, cancel := common.QuickTimeout(context.Background())
-	defer cancel()
+func (m *Manager) SendAction(action map[string]string) (map[string]string, error) {
+	//ctx, cancel := common.QuickTimeout(context.Background())
+	//defer cancel()
 	// Add ActionID if not present
 	if _, ok := action["ActionID"]; !ok {
 		action["ActionID"] = fmt.Sprintf("AMI-%d", time.Now().UnixNano())
@@ -391,6 +394,7 @@ func (m *Manager) failoverAction(ctx context.Context, action map[string]string) 
 
 		// Try this client
 		response, err := client.SendAction(action)
+
 		if err != nil {
 			m.logger.Warn("AMI failover action failed",
 				zap.String("address", client.address),
