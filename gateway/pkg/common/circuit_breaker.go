@@ -88,20 +88,24 @@ func (cb *CircuitBreaker) GetState() CircuitBreakerState {
 
 // AllowRequest determines if a request should be allowed
 func (cb *CircuitBreaker) AllowRequest() bool {
-	state := CircuitBreakerState(atomic.LoadInt32(&cb.state))
-
 	atomic.AddInt64(&cb.totalRequests, 1)
 
-	switch state {
-	case StateClosed: // Closed - allow all requests
-		return true
+	for {
+		state := CircuitBreakerState(atomic.LoadInt32(&cb.state))
 
-	case StateOpen: // Open - check timeout
-		cb.mu.RLock()
-		timeout := time.Since(cb.lastStateChange) > cb.resetTimeout
-		cb.mu.RUnlock()
+		switch state {
+		case StateClosed: // Closed - allow all requests
+			return true
 
-		if timeout {
+		case StateOpen: // Open - check timeout
+			cb.mu.RLock()
+			timeout := time.Since(cb.lastStateChange) > cb.resetTimeout
+			cb.mu.RUnlock()
+
+			if !timeout {
+				return false
+			}
+
 			// Try half-open state
 			if atomic.CompareAndSwapInt32(&cb.state, int32(StateOpen), int32(StateHalfOpen)) {
 				cb.mu.Lock()
@@ -111,17 +115,22 @@ func (cb *CircuitBreaker) AllowRequest() bool {
 
 				cb.logger.Info("Circuit half-open - testing recovery",
 					zap.String("circuit", cb.name))
+
+				// Continue to half-open case
+				continue
 			}
-			return cb.AllowRequest() // Recurse to check half-open logic
+
+			// Someone else changed the state, retry
+			continue
+
+		case StateHalfOpen: // Half-open - allow limited requests
+			reqs := atomic.AddInt32(&cb.halfOpenReqs, 1)
+			return reqs <= cb.halfOpenMaxReqs
 		}
+
+		// Should never get here, but in case we do, be safe
 		return false
-
-	case StateHalfOpen: // Half-open - allow limited requests
-		reqs := atomic.AddInt32(&cb.halfOpenReqs, 1)
-		return reqs <= cb.halfOpenMaxReqs
 	}
-
-	return false // Shouldn't get here
 }
 
 // RecordSuccess records a successful request

@@ -334,7 +334,9 @@ func (p *Proxy) handleResponse(resp *sip.Response, addr net.Addr) error {
 }
 
 // forwardRequest forwards a SIP request to the next hop
-func (p *Proxy) forwardRequest(req *sip.Request, tx *sip.ServerTransaction) error {
+func (p *Proxy) forwardRequest(ctx context.Context, req *sip.Request, tx *sip.ServerTransaction) error {
+	ctx, cancel := common.ContextWithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 	// Determine next hop
 	nextHop := p.determineNextHop(req)
 

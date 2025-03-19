@@ -53,7 +53,10 @@ type MemoryConfig struct {
 }
 
 // NewMemoryStorage creates a new in-memory storage
-func NewMemoryStorage(config MemoryConfig, logger *zap.Logger) (*MemoryStorage, error) {
+func (m *MemoryStorage) Get(ctx context.Context, key string) ([]byte, error) {
+	// Ensure timeout
+	ctx, cancel := common.QuickTimeout(ctx)
+	defer cancel()
 	if logger == nil {
 		var err error
 		logger, err = zap.NewProduction()
@@ -601,6 +604,34 @@ func (m *MemoryStorage) DeleteWSConnection(ctx context.Context, clientID string)
 	}
 
 	return ErrNotFound
+}
+
+// ListAMIActionIDs returns a list of all AMI action IDs
+func (m *MemoryStorage) ListAMIActionIDs(ctx context.Context) ([]string, error) {
+	var actionIDs []string
+
+	m.amiActions.Range(func(key, value interface{}) bool {
+		actionID := key.(string)
+		action := value.(*AMIAction)
+
+		// Skip expired actions
+		if !action.ExpireTime.IsZero() && action.ExpireTime.Before(time.Now()) {
+			m.amiActions.Delete(key)
+
+			// Update stats
+			m.statsMu.Lock()
+			m.stats.AMIActionCount--
+			m.stats.ExpiredItems++
+			m.statsMu.Unlock()
+
+			return true
+		}
+
+		actionIDs = append(actionIDs, actionID)
+		return true
+	})
+
+	return actionIDs, nil
 }
 
 // GetRegistration retrieves a SIP registration

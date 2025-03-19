@@ -4,9 +4,11 @@ package websocket
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -142,12 +144,13 @@ func (s *Server) Start(ctx context.Context) error {
 		WriteTimeout: s.config.WriteTimeout,
 		IdleTimeout:  s.config.IdleTimeout,
 	}
+	// Start connection health monitoring
 
 	// Start connection cleaner
 	s.registry.Go("connection-cleaner", func(ctx context.Context) {
 		ticker := time.NewTicker(5 * time.Minute)
 		defer ticker.Stop()
-
+		s.StartHealthMonitoring(ctx)
 		for {
 			select {
 			case <-ctx.Done():
@@ -510,7 +513,9 @@ func (a *websocketAddr) String() string {
 }
 
 // SendMessage sends a message to a WebSocket client
-func (s *Server) SendMessage(clientID string, msg []byte) error {
+func (s *Server) SendMessage(ctx context.Context, clientID string, msg []byte) error {
+	ctx, cancel := common.QuickTimeout(context.Background())
+	defer cancel()
 	s.mu.RLock()
 	client, ok := s.connections[clientID]
 	s.mu.RUnlock()
@@ -528,6 +533,127 @@ func (s *Server) SendMessage(clientID string, msg []byte) error {
 
 	client.Conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	return client.Conn.WriteMessage(websocket.TextMessage, msg)
+}
+
+// PrepareForFailover notifies clients to prepare for potential failover
+func (s *Server) PrepareForFailover() {
+	s.logger.Info("Preparing clients for potential failover")
+
+	s.mu.RLock()
+	clients := make([]*ClientConnection, 0, len(s.connections))
+	for _, client := range s.connections {
+		clients = append(clients, client)
+	}
+	s.mu.RUnlock()
+
+	// Generate a failover notification message
+	failoverData := map[string]interface{}{
+		"event":     "system-notification",
+		"type":      "failover-preparation",
+		"message":   "Server maintenance imminent, please prepare for reconnection",
+		"timestamp": time.Now().Unix(),
+	}
+
+	jsonBytes, err := json.Marshal(failoverData)
+	if err != nil {
+		s.logger.Error("Failed to encode failover message", zap.Error(err))
+		return
+	}
+
+	// Notify each client
+	for _, client := range clients {
+		client.closeMu.Lock()
+		if !client.closed {
+			client.Conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+			err := client.Conn.WriteMessage(websocket.TextMessage, jsonBytes)
+			if err != nil {
+				s.logger.Warn("Failed to send failover notification",
+					zap.String("clientID", client.ID),
+					zap.Error(err))
+			}
+		}
+		client.closeMu.Unlock()
+	}
+}
+
+// RedirectClient instructs a specific client to reconnect to a new server
+func (s *Server) RedirectClient(clientID string, newServerAddr string) error {
+	s.mu.RLock()
+	client, ok := s.connections[clientID]
+	s.mu.RUnlock()
+
+	if !ok {
+		return fmt.Errorf("client not found: %s", clientID)
+	}
+
+	// Create redirect message
+	redirectData := map[string]interface{}{
+		"event":      "system-redirect",
+		"serverAddr": newServerAddr,
+		"timestamp":  time.Now().Unix(),
+	}
+
+	jsonBytes, err := json.Marshal(redirectData)
+	if err != nil {
+		return fmt.Errorf("failed to encode redirect message: %w", err)
+	}
+
+	// Send the message
+	client.closeMu.Lock()
+	defer client.closeMu.Unlock()
+
+	if client.closed {
+		return fmt.Errorf("connection closed")
+	}
+
+	client.Conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	return client.Conn.WriteMessage(websocket.TextMessage, jsonBytes)
+}
+
+// StartHealthMonitoring begins monitoring this websocket server's health
+func (s *Server) StartHealthMonitoring(ctx context.Context) {
+	s.registry.Go("ws-health-monitor", func(ctx context.Context) {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				// Update connection count metric
+				s.mu.RLock()
+				connectionCount := len(s.connections)
+				s.mu.RUnlock()
+
+				// Store health info in storage for other instances to see
+				healthData := map[string]interface{}{
+					"addr":        s.config.BindAddr,
+					"connections": connectionCount,
+					"timestamp":   time.Now().Unix(),
+					"status":      "healthy",
+				}
+
+				healthBytes, err := json.Marshal(healthData)
+				if err != nil {
+					s.logger.Error("Failed to encode health data", zap.Error(err))
+					continue
+				}
+
+				// Store in persistent storage with hostname as key
+				hostname, _ := os.Hostname()
+				healthKey := fmt.Sprintf("ws-health:%s", hostname)
+
+				storeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+				err = s.storage.Set(storeCtx, healthKey, healthBytes, 30*time.Second)
+				cancel()
+
+				if err != nil {
+					s.logger.Error("Failed to store health data", zap.Error(err))
+				}
+			}
+		}
+	})
 }
 
 // closeConnection closes a client connection

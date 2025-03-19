@@ -80,8 +80,10 @@ func (r *RTPEngine) ensureConnection() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	// Always create a fresh UDP connection
 	if r.conn != nil {
-		return nil
+		r.conn.Close()
+		r.conn = nil
 	}
 
 	conn, err := net.DialUDP("udp", nil, r.serverAddr)
@@ -112,11 +114,21 @@ func (r *RTPEngine) Request(ctx context.Context, command map[string]interface{})
 		return nil, fmt.Errorf("circuit breaker open for RTPEngine %s:%d", r.address, r.port)
 	}
 
-	// Ensure we have a connection
+	// Create a fresh connection for each request to avoid socket issues
 	if err := r.ensureConnection(); err != nil {
 		r.circuitBreaker.RecordFailure()
 		return nil, err
 	}
+
+	// Ensure connection is properly closed
+	defer func() {
+		r.mu.Lock()
+		if r.conn != nil {
+			r.conn.Close()
+			r.conn = nil
+		}
+		r.mu.Unlock()
+	}()
 
 	// Generate random cookie
 	rand.Seed(time.Now().UnixNano())
@@ -138,28 +150,22 @@ func (r *RTPEngine) Request(ctx context.Context, command map[string]interface{})
 		deadline = time.Now().Add(r.timeout)
 	}
 
-	r.mu.Lock()
 	// Set write deadline and send the packet
 	err = r.conn.SetWriteDeadline(deadline)
 	if err != nil {
-		r.mu.Unlock()
 		r.circuitBreaker.RecordFailure()
 		return nil, fmt.Errorf("failed to set write deadline: %w", err)
 	}
 
 	_, err = r.conn.Write(fullPacket)
 	if err != nil {
-		r.mu.Unlock()
 		r.circuitBreaker.RecordFailure()
-		// Try to reconnect
-		r.Close()
 		return nil, fmt.Errorf("failed to send packet: %w", err)
 	}
 
 	// Set read deadline
 	err = r.conn.SetReadDeadline(deadline)
 	if err != nil {
-		r.mu.Unlock()
 		r.circuitBreaker.RecordFailure()
 		return nil, fmt.Errorf("failed to set read deadline: %w", err)
 	}
@@ -167,12 +173,9 @@ func (r *RTPEngine) Request(ctx context.Context, command map[string]interface{})
 	// Read the response
 	responseBuffer := make([]byte, 65535)
 	n, _, err := r.conn.ReadFromUDP(responseBuffer)
-	r.mu.Unlock()
 
 	if err != nil {
 		r.circuitBreaker.RecordFailure()
-		// Try to reconnect
-		r.Close()
 		return nil, fmt.Errorf("failed to receive response: %w", err)
 	}
 

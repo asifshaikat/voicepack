@@ -54,6 +54,26 @@ func main() {
 		logger.Fatal("Failed to create storage", zap.Error(err))
 	}
 
+	// Create coordinator for high availability
+	coordinator, err := common.NewCoordinator(stateStorage, common.CoordinatorConfig{
+		HeartbeatInterval: 5 * time.Second,
+		LeaseTimeout:      15 * time.Second,
+	}, logger)
+	if err != nil {
+		logger.Fatal("Failed to create coordinator", zap.Error(err))
+	}
+
+	// Start the coordinator
+	if err := coordinator.Start(ctx); err != nil {
+		logger.Fatal("Failed to start coordinator", zap.Error(err))
+	}
+	defer coordinator.Stop()
+
+	// Register components for leadership
+	coordinator.RegisterComponentLeadership("rtpengine")
+	coordinator.RegisterComponentLeadership("ami")
+	coordinator.RegisterComponentLeadership("sip")
+	coordinator.RegisterComponentLeadership("websocket")
 	// Create RTPEngine manager
 	rtpManager, err := rtpengine.NewManager(cfg.RTPEngine, logger, stateStorage)
 	if err != nil {

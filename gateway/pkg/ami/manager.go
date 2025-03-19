@@ -31,7 +31,7 @@ type ManagerConfig struct {
 }
 
 // NewManager creates a new AMI manager
-func NewManager(config ManagerConfig, logger *zap.Logger, registry *common.GoroutineRegistry, storage storage.StateStorage) (*Manager, error) {
+func NewManager(config ManagerConfig, logger *zap.Logger, registry *common.GoroutineRegistry, storage storage.StateStorage, coordinator *common.Coordinator) (*Manager, error) {
 	if logger == nil {
 		var err error
 		logger, err = zap.NewProduction()
@@ -134,6 +134,8 @@ func (m *Manager) Start(ctx context.Context) error {
 // tryReconnectOrFailover attempts to reconnect to the current AMI or failover to a backup
 func (m *Manager) tryReconnectOrFailover(ctx context.Context, currentIdx int) {
 	// Try to reconnect first
+	ctx, cancel := common.ContextWithTimeout(ctx, 15*time.Second)
+	defer cancel()
 	if err := m.clients[currentIdx].Connect(ctx); err != nil {
 		m.logger.Error("Failed to reconnect to AMI",
 			zap.String("address", m.clients[currentIdx].address),
@@ -172,12 +174,92 @@ func (m *Manager) replayPendingActions(ctx context.Context) {
 		return
 	}
 
-	// This is a placeholder - in a real implementation, you would:
-	// 1. Load pending actions from storage
-	// 2. Retry each action on the new active client
-	// 3. Update the action in storage or remove it if successful
-
 	m.logger.Info("Replaying pending AMI actions")
+
+	// Create a context with timeout
+	timeoutCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	// Get all pending AMI actions
+	actionIDs, err := m.storage.ListAMIActionIDs(timeoutCtx)
+	if err != nil {
+		m.logger.Error("Failed to retrieve pending AMI actions", zap.Error(err))
+		return
+	}
+
+	if len(actionIDs) == 0 {
+		m.logger.Info("No pending AMI actions to replay")
+		return
+	}
+
+	m.logger.Info("Found pending AMI actions to replay", zap.Int("count", len(actionIDs)))
+
+	// Get active client
+	client := m.GetActiveClient()
+
+	// Replay each action
+	for _, actionID := range actionIDs {
+		action, err := m.storage.GetAMIAction(timeoutCtx, actionID)
+		if err != nil {
+			m.logger.Error("Failed to retrieve AMI action",
+				zap.String("actionID", actionID),
+				zap.Error(err))
+			continue
+		}
+
+		// Skip expired actions
+		if !action.ExpireTime.IsZero() && action.ExpireTime.Before(time.Now()) {
+			m.logger.Debug("Skipping expired AMI action",
+				zap.String("actionID", actionID),
+				zap.Time("expireTime", action.ExpireTime))
+			m.storage.DeleteAMIAction(timeoutCtx, actionID)
+			continue
+		}
+
+		// Skip actions with too many retries
+		if action.Retries > 3 {
+			m.logger.Warn("AMI action exceeded retry limit",
+				zap.String("actionID", actionID),
+				zap.Int("retries", action.Retries))
+			m.storage.DeleteAMIAction(timeoutCtx, actionID)
+			continue
+		}
+
+		// Increment retry counter
+		action.Retries++
+		m.storage.StoreAMIAction(timeoutCtx, action)
+
+		// Convert parameters from string map to message format
+		actionParams := make(map[string]string)
+		for k, v := range action.Params {
+			actionParams[k] = v
+		}
+
+		m.logger.Info("Replaying AMI action",
+			zap.String("actionID", actionID),
+			zap.String("command", action.Command),
+			zap.Int("retry", action.Retries))
+
+		// Send the action
+		response, err := client.SendAction(actionParams)
+		if err != nil {
+			m.logger.Error("Failed to replay AMI action",
+				zap.String("actionID", actionID),
+				zap.Error(err))
+			continue
+		}
+
+		// Check if successful
+		if response["Response"] == "Success" {
+			m.logger.Info("Successfully replayed AMI action",
+				zap.String("actionID", actionID))
+			m.storage.DeleteAMIAction(timeoutCtx, actionID)
+		} else {
+			m.logger.Error("AMI action replay returned error",
+				zap.String("actionID", actionID),
+				zap.String("message", response["Message"]))
+		}
+	}
 }
 
 // registerEventHandlers registers event handlers on all clients
@@ -238,7 +320,10 @@ func (m *Manager) GetActiveClient() *AMIClient {
 }
 
 // SendAction sends an action to the active AMI client with failover
-func (m *Manager) SendAction(action map[string]string) (map[string]string, error) {
+func (m *Manager) SendAction(ctx context.Context, action map[string]string) (map[string]string, error) {
+	// Create context with timeout
+	ctx, cancel := common.QuickTimeout(context.Background())
+	defer cancel()
 	// Add ActionID if not present
 	if _, ok := action["ActionID"]; !ok {
 		action["ActionID"] = fmt.Sprintf("AMI-%d", time.Now().UnixNano())
@@ -282,6 +367,9 @@ func (m *Manager) SendAction(action map[string]string) (map[string]string, error
 
 // failoverAction attempts to send an action to a backup AMI client
 func (m *Manager) failoverAction(ctx context.Context, action map[string]string) (map[string]string, error) {
+	// Ensure this operation has a timeout
+	ctx, cancel := common.ContextWithTimeout(ctx, 10*time.Second)
+	defer cancel()
 	currentIdx := atomic.LoadInt32(&m.activeIdx)
 
 	// Try each client in turn

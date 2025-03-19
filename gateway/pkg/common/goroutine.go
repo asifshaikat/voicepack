@@ -79,10 +79,17 @@ func (gr *GoroutineRegistry) Shutdown(timeout time.Duration) error {
 	gr.logger.Info("Shutting down goroutine registry",
 		zap.Int64("activeCount", atomic.LoadInt64(&gr.active)))
 
+	// Cancel context to signal goroutines to stop
 	gr.cancel()
 
 	// Create a channel to signal completion
 	done := make(chan struct{})
+
+	// Create a new context with timeout for the wait
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	// Start a goroutine to wait for all workers to finish
 	go func() {
 		gr.wg.Wait()
 		close(done)
@@ -93,7 +100,7 @@ func (gr *GoroutineRegistry) Shutdown(timeout time.Duration) error {
 	case <-done:
 		gr.logger.Info("All goroutines have exited")
 		return nil
-	case <-time.After(timeout):
+	case <-ctx.Done():
 		gr.logger.Warn("Shutdown timed out, some goroutines didn't exit",
 			zap.Int64("remaining", atomic.LoadInt64(&gr.active)),
 			zap.Duration("timeout", timeout))
