@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+
+	"gateway/pkg/common"
 )
 
 // MemoryStorage implements StateStorage with in-memory maps
@@ -53,10 +55,7 @@ type MemoryConfig struct {
 }
 
 // NewMemoryStorage creates a new in-memory storage
-func (m *MemoryStorage) Get(ctx context.Context, key string) ([]byte, error) {
-	// Ensure timeout
-	ctx, cancel := common.QuickTimeout(ctx)
-	defer cancel()
+func NewMemoryStorage(config MemoryConfig, logger *zap.Logger) (*MemoryStorage, error) {
 	if logger == nil {
 		var err error
 		logger, err = zap.NewProduction()
@@ -66,29 +65,32 @@ func (m *MemoryStorage) Get(ctx context.Context, key string) ([]byte, error) {
 	}
 
 	// Set defaults
-	if config.MaxKeys <= 0 {
-		config.MaxKeys = 10000 // Default limit
+	maxKeys := config.MaxKeys
+	if maxKeys <= 0 {
+		maxKeys = 10000 // Default limit
 	}
 
-	if config.CleanupInterval <= 0 {
-		config.CleanupInterval = 5 * time.Minute // Default cleanup interval
+	cleanupInterval := config.CleanupInterval
+	if cleanupInterval <= 0 {
+		cleanupInterval = 5 * time.Minute // Default cleanup interval
 	}
 
-	if config.ShardCount <= 0 {
-		config.ShardCount = 32 // Default shard count (power of 2)
+	shardCount := config.ShardCount
+	if shardCount <= 0 {
+		shardCount = 32 // Default shard count (power of 2)
 	}
 
 	// Create sharded maps
-	shards := make([]*sync.Map, config.ShardCount)
-	for i := 0; i < config.ShardCount; i++ {
+	shards := make([]*sync.Map, shardCount)
+	for i := 0; i < shardCount; i++ {
 		shards[i] = &sync.Map{}
 	}
 
 	storage := &MemoryStorage{
 		data:              shards,
-		shardCount:        config.ShardCount,
-		maxKeys:           config.MaxKeys,
-		cleanupInterval:   config.CleanupInterval,
+		shardCount:        shardCount,
+		maxKeys:           maxKeys,
+		cleanupInterval:   cleanupInterval,
 		persistPath:       config.PersistPath,
 		persistOnShutdown: config.PersistOnShutdown,
 		logger:            logger,
@@ -107,10 +109,10 @@ func (m *MemoryStorage) Get(ctx context.Context, key string) ([]byte, error) {
 	go storage.cleanupLoop()
 
 	logger.Info("In-memory storage initialized",
-		zap.Int("maxKeys", config.MaxKeys),
-		zap.String("cleanupInterval", config.CleanupInterval.String()),
+		zap.Int("maxKeys", maxKeys),
+		zap.String("cleanupInterval", cleanupInterval.String()),
 		zap.String("persistPath", config.PersistPath),
-		zap.Int("shardCount", config.ShardCount))
+		zap.Int("shardCount", shardCount))
 
 	return storage, nil
 }
@@ -130,6 +132,10 @@ func (m *MemoryStorage) getShard(key string) *sync.Map {
 
 // Get retrieves a value from the key-value store
 func (m *MemoryStorage) Get(ctx context.Context, key string) ([]byte, error) {
+	// Ensure timeout
+	ctx, cancel := common.QuickTimeout(ctx)
+	defer cancel()
+
 	if key == "" {
 		return nil, ErrInvalidKey
 	}

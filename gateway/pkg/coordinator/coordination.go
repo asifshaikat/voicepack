@@ -1,5 +1,5 @@
 // pkg/common/coordination.go
-package common
+package coordinator
 
 import (
 	"context"
