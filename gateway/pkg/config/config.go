@@ -78,24 +78,26 @@ type AsteriskClientConfig struct {
 
 // SIPConfig represents SIP proxy configuration
 type SIPConfig struct {
-	UDPBindAddr    string `yaml:"udp_bind_addr"`
-	ProxyURI       string `yaml:"proxy_uri"`
-	DefaultNextHop string `yaml:"default_next_hop"`
-	MaxForwards    int    `yaml:"max_forwards"`
-	UserAgent      string `yaml:"user_agent"`
+	UDPBindAddr          string `yaml:"udp_bind_addr"`
+	ProxyURI             string `yaml:"proxy_uri"`
+	DefaultNextHop       string `yaml:"default_next_hop"`
+	MaxForwards          int    `yaml:"max_forwards"`
+	UserAgent            string `yaml:"user_agent"`
+	DisableSIPProcessing bool   `yaml:"disable_sip_processing"`
 }
 
 // WebSocketConfig represents WebSocket server configuration
 type WebSocketConfig struct {
-	BindAddr       string `yaml:"bind_addr"`
-	CertFile       string `yaml:"cert_file"`
-	KeyFile        string `yaml:"key_file"`
-	MaxConnections int    `yaml:"max_connections"`
-	ReadTimeoutMS  int    `yaml:"read_timeout_ms"`
-	WriteTimeoutMS int    `yaml:"write_timeout_ms"`
-	IdleTimeoutMS  int    `yaml:"idle_timeout_ms"`
-	EnableIPv4Only bool   `yaml:"enable_ipv4_only"`
-	ServerName     string `yaml:"server_name"`
+	BindAddr             string `yaml:"bind_addr"`
+	CertFile             string `yaml:"cert_file"`
+	KeyFile              string `yaml:"key_file"`
+	MaxConnections       int    `yaml:"max_connections"`
+	ReadTimeoutMS        int    `yaml:"read_timeout_ms"`
+	WriteTimeoutMS       int    `yaml:"write_timeout_ms"`
+	IdleTimeoutMS        int    `yaml:"idle_timeout_ms"`
+	EnableIPv4Only       bool   `yaml:"enable_ipv4_only"`
+	ServerName           string `yaml:"server_name"`
+	DisableSIPProcessing bool   `yaml:"disable_sip_processing"`
 }
 
 // MetricsConfig represents Prometheus metrics configuration

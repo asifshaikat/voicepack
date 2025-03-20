@@ -40,6 +40,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "ERROR: Failed to load configuration: %v\n", err)
 		log.Fatalf("Failed to load configuration: %v", err)
 	}
+	fmt.Printf("DEBUG: SIP.DisableSIPProcessing = %v\n", cfg.SIP.DisableSIPProcessing)
 	fmt.Fprintf(os.Stderr, "DEBUG-3: Configuration loaded successfully\n")
 
 	// Setup logger

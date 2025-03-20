@@ -54,7 +54,6 @@ func (r *Registry) Get(user string) string {
 
 // setupSipProxy builds a SIP proxy server that listens on the given ip
 // and forwards requests to proxydst if not found in the registry.
-
 func setupSipProxy(proxydst, ip string) (*sipgo.Server, *sipgo.Client, *Registry) {
 	// Use slog.Default() for simple logging.
 	log := slog.Default()
@@ -75,7 +74,6 @@ func setupSipProxy(proxydst, ip string) (*sipgo.Server, *sipgo.Client, *Registry
 	}
 
 	// Create a SIP client without binding to a specific local address
-	// This allows the OS to dynamically allocate ports for outgoing connections
 	client, err := sipgo.NewClient(ua)
 	if err != nil {
 		log.Error("Failed to create client", "error", err)
@@ -108,6 +106,8 @@ func setupSipProxy(proxydst, ip string) (*sipgo.Server, *sipgo.Client, *Registry
 
 	// route handles generic forwarding logic.
 	var route = func(req *sip.Request, tx sip.ServerTransaction) {
+		log.Debug("route() called - forwarding logic", "method", req.Method.String())
+
 		dstAddr := getDestination(req)
 		if dstAddr == "" {
 			reply(tx, req, 404, "Not found")
@@ -115,18 +115,24 @@ func setupSipProxy(proxydst, ip string) (*sipgo.Server, *sipgo.Client, *Registry
 		}
 		ctx := context.Background()
 		req.SetDestination(dstAddr)
+
 		clTx, err := client.TransactionRequest(ctx, req,
 			sipgo.ClientRequestAddVia,
 			sipgo.ClientRequestAddRecordRoute,
 		)
 		if err != nil {
-			log.Error("Failed to create client transaction", "error", err)
+			log.Error("Failed to create client transaction in route()",
+				"error", err,
+				"destination", dstAddr)
 			reply(tx, req, 500, "")
 			return
 		}
 		defer clTx.Terminate()
 
-		log.Debug("Starting transaction", "method", req.Method.String())
+		log.Debug("Starting transaction in route()",
+			"method", req.Method.String(),
+			"destination", dstAddr)
+
 		for {
 			select {
 			case res, more := <-clTx.Responses():
@@ -138,15 +144,17 @@ func setupSipProxy(proxydst, ip string) (*sipgo.Server, *sipgo.Client, *Registry
 				// Remove the topmost Via header.
 				res.RemoveHeader("Via")
 				if err := tx.Respond(res); err != nil {
-					log.Error("Failed to forward response", "error", err)
+					log.Error("Failed to forward response in route()", "error", err)
 				}
 			case <-clTx.Done():
 				if err := clTx.Err(); err != nil {
-					log.Error("Client transaction ended with error", "error", err)
+					log.Error("Client transaction ended with error in route()", "error", err)
 				}
 				return
 			case ack := <-tx.Acks():
-				log.Info("Proxying ACK", "method", req.Method.String(), "dstAddr", dstAddr)
+				log.Info("Proxying ACK",
+					"method", req.Method.String(),
+					"dstAddr", dstAddr)
 				ack.SetDestination(dstAddr)
 				if wErr := client.WriteRequest(ack); wErr != nil {
 					log.Error("ACK forward failed", "error", wErr)
@@ -154,6 +162,7 @@ func setupSipProxy(proxydst, ip string) (*sipgo.Server, *sipgo.Client, *Registry
 			case <-tx.Done():
 				if err := tx.Err(); err != nil {
 					if errors.Is(err, sip.ErrTransactionCanceled) {
+						// We might send CANCEL downstream
 						if req.IsInvite() {
 							r := newCancelRequest(req)
 							res, cErr := client.Do(ctx, r)
@@ -164,10 +173,10 @@ func setupSipProxy(proxydst, ip string) (*sipgo.Server, *sipgo.Client, *Registry
 							}
 						}
 					} else {
-						log.Error("Server transaction ended with error", "error", err)
+						log.Error("Server transaction ended with error in route()", "error", err)
 					}
 				}
-				log.Debug("Transaction done", "method", req.Method.String())
+				log.Debug("Transaction done in route()", "method", req.Method.String())
 				return
 			}
 		}
@@ -186,12 +195,13 @@ func setupSipProxy(proxydst, ip string) (*sipgo.Server, *sipgo.Client, *Registry
 		}
 		addr := uri.Host + ":" + strconv.Itoa(uri.Port)
 		registry.Add(uri.User, addr)
-		log.Debug(fmt.Sprintf("Registered %s -> %s", uri.User, addr))
+		log.Debug(fmt.Sprintf("Registered %s -> %s (OnRegister handler)", uri.User, addr))
+
 		res := sip.NewResponseFromRequest(req, 200, "OK", nil)
 		uri.UriParams = sip.NewParams()
 		uri.UriParams.Add("transport", req.Transport())
 		if err := tx.Respond(res); err != nil {
-			log.Error("Failed to respond 200 to REGISTER", "error", err)
+			log.Error("Failed to respond 200 to REGISTER in OnRegister", "error", err)
 		}
 	})
 
@@ -202,11 +212,12 @@ func setupSipProxy(proxydst, ip string) (*sipgo.Server, *sipgo.Client, *Registry
 	srv.OnAck(func(req *sip.Request, tx sip.ServerTransaction) {
 		dstAddr := getDestination(req)
 		if dstAddr == "" {
+			log.Debug("OnAck: no destination found, skipping")
 			return
 		}
 		req.SetDestination(dstAddr)
 		if err := client.WriteRequest(req, sipgo.ClientRequestAddVia); err != nil {
-			log.Error("ACK forward failed", "error", err)
+			log.Error("ACK forward failed in OnAck", "error", err)
 			reply(tx, req, 500, "")
 		}
 	})
@@ -240,11 +251,12 @@ func newCancelRequest(inviteRequest *sip.Request) *sip.Request {
 
 // SIPConfig represents the SIP proxy configuration.
 type SIPConfig struct {
-	UDPBindAddr    string // e.g., "127.0.0.1:5060"
-	ProxyURI       string
-	DefaultNextHop string
-	MaxForwards    int
-	UserAgent      string
+	UDPBindAddr          string // e.g., "127.0.0.1:5060"
+	ProxyURI             string
+	DefaultNextHop       string
+	MaxForwards          int
+	UserAgent            string
+	DisableSIPProcessing bool
 }
 
 // Proxy wraps the underlying sipgo.Server and holds additional state.
@@ -257,15 +269,36 @@ type Proxy struct {
 	rtpEngine  *rtpengine.Manager
 	transports []Transport
 	proxyDst   string
+	config     SIPConfig
 }
 
 // NewProxy creates a new SIP proxy instance based on the provided configuration.
-// The proxydst is taken from cfg.DefaultNextHop and the IP to bind from cfg.UDPBindAddr.
-func NewProxy(cfg SIPConfig, storage storage.StateStorage, rtpEngine *rtpengine.Manager, logger *zap.Logger) (*Proxy, error) {
+func NewProxy(
+	cfg SIPConfig,
+	storage storage.StateStorage,
+	rtpEngine *rtpengine.Manager,
+	logger *zap.Logger,
+) (*Proxy, error) {
+
 	srv, client, registry := setupSipProxy(cfg.DefaultNextHop, cfg.UDPBindAddr)
 	if srv == nil {
 		return nil, errors.New("failed to create SIP server")
 	}
+
+	// Force DisableSIPProcessing to true regardless of the loaded value.
+	cfg.DisableSIPProcessing = true
+
+	logger.Warn("NewProxy called",
+		zap.String("UDPBindAddr", cfg.UDPBindAddr),
+		zap.String("DefaultNextHop", cfg.DefaultNextHop),
+		zap.Bool("DisableSIPProcessing", cfg.DisableSIPProcessing),
+	)
+
+	logger.Warn("Successfully created sipgo.Server + sipgo.Client",
+		zap.String("DefaultNextHop", cfg.DefaultNextHop),
+		zap.Bool("DisableSIPProcessing", cfg.DisableSIPProcessing),
+	)
+
 	return &Proxy{
 		server:     srv,
 		client:     client,
@@ -273,20 +306,26 @@ func NewProxy(cfg SIPConfig, storage storage.StateStorage, rtpEngine *rtpengine.
 		logger:     logger,
 		storage:    storage,
 		rtpEngine:  rtpEngine,
-		transports: make([]Transport, 0),
+		transports: []Transport{},
 		proxyDst:   cfg.DefaultNextHop,
+		config:     cfg, // now cfg.DisableSIPProcessing is always true
 	}, nil
 }
 
 // AddTransport adds a transport to the SIP proxy.
 func (p *Proxy) AddTransport(t Transport) {
+	p.logger.Debug("AddTransport called", zap.String("bindAddr", t.(*UDPTransport).bindAddr))
 	p.transports = append(p.transports, t)
-	// Optionally, you can integrate this transport with the underlying server.
 }
 
 // Start starts the SIP proxy server.
 func (p *Proxy) Start(ctx context.Context) error {
-	// Start the SIP server in a background goroutine to avoid blocking
+	p.logger.Warn("Proxy.Start() called",
+		zap.String("UDPBindAddr", p.config.UDPBindAddr),
+		zap.String("DefaultNextHop", p.config.DefaultNextHop),
+		zap.Bool("DisableSIPProcessing", p.config.DisableSIPProcessing),
+	)
+
 	go func() {
 		err := p.server.ListenAndServe(ctx, "udp", "")
 		if err != nil && err != context.Canceled {
@@ -294,26 +333,34 @@ func (p *Proxy) Start(ctx context.Context) error {
 		}
 	}()
 
-	// Return immediately to keep the application startup non-blocking
 	return nil
 }
 
 // Stop stops the SIP proxy server.
 func (p *Proxy) Stop() error {
+	p.logger.Info("Stop() called on SIP proxy")
+	// If needed, gracefully shut down p.server here
 	return nil
 }
 
-// HandleMessage implements the websocket.SIPHandler interface to process SIP messages from WebSocket connections
-
+// HandleMessage implements the websocket.SIPHandler interface to process SIP messages from WebSocket connections.
 func (p *Proxy) HandleMessage(msg Message, addr net.Addr) error {
 	clientAddr := addr.String()
 
-	// No need to parse the message as it's already parsed
+	// Log the method and disable-flag for every inbound message
+	p.logger.Warn("HandleMessage invoked",
+		zap.String("clientAddr", clientAddr),
+		zap.Bool("DisableSIPProcessing", p.config.DisableSIPProcessing),
+	)
 
-	// Process based on message type
 	if req, ok := msg.(*Request); ok {
-		// Handle different request types
-		switch req.Method.String() {
+		method := req.Method.String()
+		p.logger.Debug("Decoded SIP request",
+			zap.String("method", method),
+			zap.String("clientAddr", clientAddr),
+		)
+
+		switch method {
 		case "REGISTER":
 			return p.handleRegister(req, clientAddr)
 		case "INVITE":
@@ -328,20 +375,29 @@ func (p *Proxy) HandleMessage(msg Message, addr net.Addr) error {
 			return p.handleOptions(req, clientAddr)
 		default:
 			p.logger.Debug("Unhandled SIP method",
-				zap.String("method", req.Method.String()),
+				zap.String("method", method),
 				zap.String("client", clientAddr))
 		}
 	} else if resp, ok := msg.(*Response); ok {
-		// Handle SIP responses
+		p.logger.Debug("Decoded SIP response",
+			zap.Int("status", resp.StatusCode),
+			zap.String("clientAddr", clientAddr),
+			zap.Bool("DisableSIPProcessing", p.config.DisableSIPProcessing),
+		)
 		return p.handleResponse(resp, clientAddr)
 	}
 
 	return nil
 }
 
-// Helper methods with the proper signature
+// SIP Request Handlers
 
 func (p *Proxy) handleRegister(req *Request, clientAddr string) error {
+	p.logger.Warn("handleRegister invoked",
+		zap.String("clientAddr", clientAddr),
+		zap.Bool("DisableSIPProcessing", p.config.DisableSIPProcessing),
+	)
+
 	contactHeader := req.Contact()
 	if contactHeader == nil || contactHeader.Address.Host == "" {
 		p.logger.Error("Missing address of record in REGISTER",
@@ -359,47 +415,102 @@ func (p *Proxy) handleRegister(req *Request, clientAddr string) error {
 		return errors.New("contact address not provided")
 	}
 
+	// Store the registration info locally (if desired).
 	addr := uri.Host + ":" + strconv.Itoa(uri.Port)
 	p.registry.Add(uri.User, addr)
 	p.logger.Debug("Registered user via WebSocket",
 		zap.String("user", uri.User),
-		zap.String("address", addr))
+		zap.String("address", addr),
+		zap.String("clientAddr", clientAddr),
+	)
 
-	// Forward to server if needed
+	// If disabled, skip forwarding to local SIP transactions.
+	if p.config.DisableSIPProcessing {
+		p.logger.Warn("Skipping forwardRequest for REGISTER (DisableSIPProcessing=true)",
+			zap.String("client", clientAddr))
+		return nil
+	}
+
+	// Otherwise, forward to server if needed.
 	return p.forwardRequest(req, clientAddr)
 }
 
 func (p *Proxy) handleInvite(req *Request, clientAddr string) error {
+	p.logger.Warn("handleInvite invoked",
+		zap.String("clientAddr", clientAddr),
+		zap.Bool("DisableSIPProcessing", p.config.DisableSIPProcessing),
+	)
 	return p.forwardRequest(req, clientAddr)
 }
 
 func (p *Proxy) handleBye(req *Request, clientAddr string) error {
+	p.logger.Warn("handleBye invoked",
+		zap.String("clientAddr", clientAddr),
+		zap.Bool("DisableSIPProcessing", p.config.DisableSIPProcessing),
+	)
 	return p.forwardRequest(req, clientAddr)
 }
 
 func (p *Proxy) handleAck(req *Request, clientAddr string) error {
+	p.logger.Warn("handleAck invoked",
+		zap.String("clientAddr", clientAddr),
+		zap.Bool("DisableSIPProcessing", p.config.DisableSIPProcessing),
+	)
 	return p.forwardRequest(req, clientAddr)
 }
 
 func (p *Proxy) handleCancel(req *Request, clientAddr string) error {
+	p.logger.Warn("handleCancel invoked",
+		zap.String("clientAddr", clientAddr),
+		zap.Bool("DisableSIPProcessing", p.config.DisableSIPProcessing),
+	)
 	return p.forwardRequest(req, clientAddr)
 }
 
 func (p *Proxy) handleOptions(req *Request, clientAddr string) error {
+	p.logger.Warn("handleOptions invoked",
+		zap.String("clientAddr", clientAddr),
+		zap.Bool("DisableSIPProcessing", p.config.DisableSIPProcessing),
+	)
 	return p.forwardRequest(req, clientAddr)
 }
 
-func (p *Proxy) handleResponse(resp *Response, clientAddr string) error {
-	// Process SIP responses if needed
-	p.logger.Debug("Received SIP response via WebSocket",
-		zap.Int("status", resp.StatusCode),
-		zap.String("client", clientAddr))
+// SIP Response Handler
 
-	// Forward response if needed
+func (p *Proxy) handleResponse(resp *Response, clientAddr string) error {
+	p.logger.Warn("handleResponse invoked (SIP response)",
+		zap.Int("statusCode", resp.StatusCode),
+		zap.String("clientAddr", clientAddr),
+		zap.Bool("DisableSIPProcessing", p.config.DisableSIPProcessing),
+	)
+	// If you want to forward responses back somewhere, add logic here.
 	return nil
 }
 
+// Actually forward the request by creating a local SIP transaction (only if allowed).
 func (p *Proxy) forwardRequest(req *Request, clientAddr string) error {
+
+	/* 	// Hard bypass if you want to completely disable local SIP processing.
+	   	p.logger.Warn("Hard bypass in forwardRequest: skipping local SIP transaction creation",
+	   		zap.String("method", req.Method.String()),
+	   		zap.String("clientAddr", clientAddr),
+	   	)
+	   	return nil */
+	p.logger.Warn("forwardRequest called",
+		zap.String("method", req.Method.String()),
+		zap.String("clientAddr", clientAddr),
+		zap.Bool("DisableSIPProcessing", p.config.DisableSIPProcessing),
+	)
+
+	// Hard short-circuit if disabled
+	if p.config.DisableSIPProcessing {
+		p.logger.Warn("Short-circuit: skipping local SIP transaction creation (DisableSIPProcessing=true)",
+			zap.String("method", req.Method.String()),
+			zap.String("client", clientAddr),
+		)
+		return nil
+	}
+
 	// Determine destination
 	dstAddr := p.getDestination(req)
 	if dstAddr == "" {
@@ -408,10 +519,15 @@ func (p *Proxy) forwardRequest(req *Request, clientAddr string) error {
 			zap.String("client", clientAddr))
 		return errors.New("no destination found")
 	}
-
 	req.SetDestination(dstAddr)
 
-	// Create context with timeout for the request
+	p.logger.Debug("Proceeding with local SIP transaction creation",
+		zap.String("method", req.Method.String()),
+		zap.String("client", clientAddr),
+		zap.String("dstAddr", dstAddr),
+	)
+
+	// Create context with timeout
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -425,56 +541,59 @@ func (p *Proxy) forwardRequest(req *Request, clientAddr string) error {
 			sipgo.ClientRequestAddVia,
 			sipgo.ClientRequestAddRecordRoute,
 		)
-
 		if err == nil {
-			break // Success, exit retry loop
+			break // success
 		}
 
-		// Check if it's a binding error
 		if strings.Contains(err.Error(), "bind: address already in use") {
-			p.logger.Warn("Port binding issue, retrying",
+			p.logger.Warn("Port binding issue, retrying in forwardRequest()",
 				zap.Int("attempt", attempt+1),
 				zap.String("client", clientAddr))
-
-			// Short delay before retry
 			time.Sleep(200 * time.Millisecond)
 			continue
 		}
 
-		// For other types of errors, don't retry
-		p.logger.Error("Failed to create client transaction for WebSocket request",
+		p.logger.Error("Failed to create client transaction for WebSocket request in forwardRequest()",
 			zap.Error(err),
-			zap.String("client", clientAddr))
+			zap.String("client", clientAddr),
+			zap.Int("attempt", attempt+1),
+		)
 		return err
 	}
 
-	// If we exhausted all retries and still have an error
 	if err != nil {
-		p.logger.Error("Failed to create client transaction after retries",
+		p.logger.Error("Failed to create client transaction after retries in forwardRequest()",
 			zap.Error(err),
 			zap.String("client", clientAddr),
 			zap.Int("maxRetries", maxRetries))
 		return err
 	}
-
 	defer clTx.Terminate()
 
-	p.logger.Debug("Forwarded WebSocket SIP request",
+	p.logger.Debug("Forwarded WebSocket SIP request successfully",
 		zap.String("method", req.Method.String()),
 		zap.String("client", clientAddr),
-		zap.String("destination", dstAddr))
+		zap.String("destination", dstAddr),
+	)
 
 	return nil
 }
+
 func (p *Proxy) getDestination(req *sip.Request) string {
 	toHeader := req.To()
 	if toHeader == nil || toHeader.Address.Host == "" {
+		p.logger.Debug("getDestination returning proxyDst due to empty To header",
+			zap.String("proxyDst", p.proxyDst))
 		return p.proxyDst
 	}
 	dst := p.registry.Get(toHeader.Address.User)
 	if dst == "" {
+		p.logger.Debug("getDestination: not found in registry, returning proxyDst",
+			zap.String("proxyDst", p.proxyDst),
+			zap.String("toUser", toHeader.Address.User))
 		return p.proxyDst
 	}
+	p.logger.Debug("getDestination found registry entry", zap.String("finalDst", dst))
 	return dst
 }
 

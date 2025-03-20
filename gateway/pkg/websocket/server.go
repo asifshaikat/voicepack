@@ -15,11 +15,11 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"go.uber.org/zap"
-
 	"gateway/pkg/common"
 	"gateway/pkg/sip"
 	"gateway/pkg/storage"
+
+	"go.uber.org/zap"
 )
 
 // Server implements a WebSocket server for WebRTC clients
@@ -40,15 +40,16 @@ type Server struct {
 
 // ServerConfig defines the configuration for the WebSocket server
 type ServerConfig struct {
-	BindAddr       string
-	CertFile       string
-	KeyFile        string
-	MaxConnections int
-	ReadTimeout    time.Duration
-	WriteTimeout   time.Duration
-	IdleTimeout    time.Duration
-	EnableIPv4Only bool
-	ServerName     string
+	BindAddr             string
+	CertFile             string
+	KeyFile              string
+	MaxConnections       int
+	ReadTimeout          time.Duration
+	WriteTimeout         time.Duration
+	IdleTimeout          time.Duration
+	EnableIPv4Only       bool
+	ServerName           string
+	DisableSIPProcessing bool
 }
 
 // SIPHandler handles SIP messages from WebSocket clients
@@ -72,7 +73,7 @@ type ClientConnection struct {
 	closeMu      sync.Mutex
 	clientDone   chan struct{}
 	backendDone  chan struct{}
-	cancelFunc   context.CancelFunc // Added to properly manage connection context
+	cancelFunc   context.CancelFunc // manage connection context
 }
 
 // NewServer creates a new WebSocket server
@@ -89,19 +90,15 @@ func NewServer(config ServerConfig, storage storage.StateStorage, logger *zap.Lo
 	if config.MaxConnections <= 0 {
 		config.MaxConnections = 1000
 	}
-
 	if config.ReadTimeout <= 0 {
 		config.ReadTimeout = 30 * time.Second
 	}
-
 	if config.WriteTimeout <= 0 {
 		config.WriteTimeout = 30 * time.Second
 	}
-
 	if config.IdleTimeout <= 0 {
 		config.IdleTimeout = 120 * time.Second
 	}
-
 	if config.ServerName == "" {
 		config.ServerName = "WebRTC-SIP-Gateway"
 	}
@@ -120,11 +117,15 @@ func NewServer(config ServerConfig, storage storage.StateStorage, logger *zap.Lo
 			},
 			Subprotocols: []string{"sip"},
 		},
-		circuitBreaker: common.NewCircuitBreaker("websocket", common.CircuitBreakerConfig{
-			FailureThreshold: 5,
-			ResetTimeout:     30 * time.Second,
-			HalfOpenMaxReqs:  3,
-		}, logger),
+		circuitBreaker: common.NewCircuitBreaker(
+			"websocket",
+			common.CircuitBreakerConfig{
+				FailureThreshold: 5,
+				ResetTimeout:     30 * time.Second,
+				HalfOpenMaxReqs:  3,
+			},
+			logger,
+		),
 	}
 
 	return server, nil
@@ -140,7 +141,8 @@ func (s *Server) Start(ctx context.Context) error {
 	s.logger.Info("Starting WebSocket server",
 		zap.String("bindAddr", s.config.BindAddr),
 		zap.Bool("tlsEnabled", s.config.CertFile != "" && s.config.KeyFile != ""),
-		zap.String("backendServer", s.config.ServerName))
+		zap.String("backendServer", s.config.ServerName),
+	)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleWebSocket)
@@ -159,7 +161,8 @@ func (s *Server) Start(ctx context.Context) error {
 		zap.String("bindAddr", s.config.BindAddr),
 		zap.Duration("readTimeout", s.config.ReadTimeout),
 		zap.Duration("writeTimeout", s.config.WriteTimeout),
-		zap.Duration("idleTimeout", s.config.IdleTimeout))
+		zap.Duration("idleTimeout", s.config.IdleTimeout),
+	)
 
 	// Start connection health monitoring and cleaner
 	s.registry.Go("connection-cleaner", func(ctx context.Context) {
@@ -189,29 +192,26 @@ func (s *Server) Start(ctx context.Context) error {
 		if s.config.CertFile != "" && s.config.KeyFile != "" {
 			s.logger.Debug("Using TLS configuration",
 				zap.String("certFile", s.config.CertFile),
-				zap.String("keyFile", s.config.KeyFile))
-
+				zap.String("keyFile", s.config.KeyFile),
+			)
 			if s.config.EnableIPv4Only {
 				// Create IPv4-only listener
 				s.logger.Debug("Creating IPv4-only listener")
 				ln, err := net.Listen("tcp4", s.config.BindAddr)
 				if err != nil {
-					s.logger.Error("Failed to create IPv4 listener",
-						zap.Error(err))
+					s.logger.Error("Failed to create IPv4 listener", zap.Error(err))
 					return
 				}
-
 				s.logger.Debug("Successfully created IPv4 listener",
-					zap.String("localAddress", ln.Addr().String()))
+					zap.String("localAddress", ln.Addr().String()),
+				)
 
 				s.logger.Debug("Loading TLS certificate")
 				cert, err := tls.LoadX509KeyPair(s.config.CertFile, s.config.KeyFile)
 				if err != nil {
-					s.logger.Error("Failed to load TLS certificate",
-						zap.Error(err))
+					s.logger.Error("Failed to load TLS certificate", zap.Error(err))
 					return
 				}
-
 				tlsConfig := &tls.Config{
 					Certificates: []tls.Certificate{cert},
 					MinVersion:   tls.VersionTLS12,
@@ -231,10 +231,10 @@ func (s *Server) Start(ctx context.Context) error {
 				ln, err := net.Listen("tcp4", s.config.BindAddr)
 				if err != nil {
 					s.logger.Error("Failed to create IPv4 listener (non-TLS)",
-						zap.Error(err))
+						zap.Error(err),
+					)
 					return
 				}
-
 				s.logger.Debug("Starting non-TLS server on IPv4 listener")
 				err = s.httpServer.Serve(ln)
 			} else {
@@ -243,10 +243,9 @@ func (s *Server) Start(ctx context.Context) error {
 			}
 		}
 
-		// This will execute when the server stops (either normally or with error)
+		// This will execute when the server stops
 		if err != nil && err != http.ErrServerClosed {
-			s.logger.Error("HTTP server failed with error",
-				zap.Error(err))
+			s.logger.Error("HTTP server failed with error", zap.Error(err))
 
 			// Check for common binding errors
 			if opErr, ok := err.(*net.OpError); ok {
@@ -255,7 +254,8 @@ func (s *Server) Start(ctx context.Context) error {
 					zap.String("net", opErr.Net),
 					zap.Any("addr", opErr.Addr),
 					zap.Bool("timeout", opErr.Timeout()),
-					zap.Bool("temporary", opErr.Temporary()))
+					zap.Bool("temporary", opErr.Temporary()),
+				)
 			}
 		} else if err == http.ErrServerClosed {
 			s.logger.Info("WebSocket server closed normally")
@@ -289,14 +289,14 @@ func (s *Server) Stop() error {
 }
 
 // handleWebSocket handles WebSocket connection requests
-// handleWebSocket handles WebSocket connection requests
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	clientAddr := r.RemoteAddr
 	s.logger.Debug("Incoming WebSocket handshake request",
 		zap.String("client", clientAddr),
 		zap.String("url", r.URL.String()),
 		zap.String("path", r.URL.Path),
-		zap.String("userAgent", r.UserAgent()))
+		zap.String("userAgent", r.UserAgent()),
+	)
 
 	// Check if we're at capacity
 	s.mu.RLock()
@@ -304,7 +304,8 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		s.mu.RUnlock()
 		s.logger.Warn("Connection rejected: too many connections",
 			zap.String("client", clientAddr),
-			zap.Int("maxConnections", s.config.MaxConnections))
+			zap.Int("maxConnections", s.config.MaxConnections),
+		)
 		http.Error(w, "Too many connections", http.StatusServiceUnavailable)
 		return
 	}
@@ -313,7 +314,8 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// Check circuit breaker
 	if !s.circuitBreaker.AllowRequest() {
 		s.logger.Warn("Connection rejected: circuit breaker open",
-			zap.String("client", clientAddr))
+			zap.String("client", clientAddr),
+		)
 		http.Error(w, "Service temporarily unavailable", http.StatusServiceUnavailable)
 		return
 	}
@@ -333,12 +335,14 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	s.logger.Debug("SIP protocol details",
 		zap.String("client", clientAddr),
 		zap.Strings("subprotocols", clientSubProtocols),
-		zap.String("sipTransport", sipTransport))
+		zap.String("sipTransport", sipTransport),
+	)
 
 	// Verify it's a valid WebSocket upgrade
 	if !websocket.IsWebSocketUpgrade(r) {
 		s.logger.Warn("Not a valid WebSocket upgrade request",
-			zap.String("client", clientAddr))
+			zap.String("client", clientAddr),
+		)
 		http.Error(w, "Not a WebSocket handshake", http.StatusBadRequest)
 		return
 	}
@@ -350,19 +354,15 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	} else {
 		protocols = []string{"sip"}
 	}
-
-	// Set subprotocols in upgrader
 	s.upgrader.Subprotocols = protocols
-
-	// Set a timeout for the HTTP handler
-	r.Context().Done()
 
 	// First, upgrade the connection
 	conn, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		s.logger.Error("WebSocket upgrade failed",
 			zap.String("remoteAddr", clientAddr),
-			zap.Error(err))
+			zap.Error(err),
+		)
 		s.circuitBreaker.RecordFailure()
 		return
 	}
@@ -387,7 +387,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		LastActivity: time.Now(),
 		clientDone:   make(chan struct{}),
 		backendDone:  make(chan struct{}),
-		cancelFunc:   wsCancel, // Store cancel function for cleanup
+		cancelFunc:   wsCancel,
 	}
 
 	// Store the connection
@@ -403,9 +403,10 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		zap.String("clientID", clientID),
 		zap.String("remoteAddr", clientAddr),
 		zap.String("protocol", client.Protocol),
-		zap.String("sipTransport", sipTransport))
+		zap.String("sipTransport", sipTransport),
+	)
 
-	// Handle the connection with the long-lived context in a background goroutine
+	// Handle the connection in a background goroutine
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
@@ -422,12 +423,13 @@ func (s *Server) handleClient(ctx context.Context, client *ClientConnection, sip
 	defer s.closeConnection(client)
 
 	// Setup error channel
-	errChan := make(chan error, 3) // Increased buffer size to handle more potential errors
+	errChan := make(chan error, 3) // handle multiple errors
 
 	// Setup backend connection
 	s.logger.Debug("Establishing backend connection",
 		zap.String("clientID", client.ID),
-		zap.String("backendServer", s.config.ServerName))
+		zap.String("backendServer", s.config.ServerName),
+	)
 
 	// Parse the backend URL
 	backendURL := s.config.ServerName
@@ -444,43 +446,42 @@ func (s *Server) handleClient(ctx context.Context, client *ClientConnection, sip
 	// Add essential headers for WebSocket handshake
 	backendHeaders.Add("Origin", "https://"+host)
 	backendHeaders.Add("Host", host)
-
-	// Add a User-Agent to identify your gateway
 	backendHeaders.Add("User-Agent", "QalqulVoiceGateway/1.0")
 
 	s.logger.Debug("Connecting to backend with headers",
 		zap.String("backendURL", backendURL),
-		zap.Any("headers", backendHeaders))
+		zap.Any("headers", backendHeaders),
+	)
 
-	// Create dialer with proper TLS configuration
+	// Create dialer with TLS config
 	dialer := websocket.Dialer{
 		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: true, // Consider making this configurable
+			InsecureSkipVerify: true, // consider making configurable
 		},
 		HandshakeTimeout: 10 * time.Second,
-		Subprotocols:     []string{client.Protocol}, // Use the same subprotocol as client
+		Subprotocols:     []string{client.Protocol}, // match client subprotocol
 	}
 
 	fmt.Fprintf(os.Stderr, "CONSOLE: Attempting backend connection to %s\n", backendURL)
 
-	// Connect to backend with proper headers
+	// Connect to backend
 	backendConn, resp, err := dialer.Dial(backendURL, backendHeaders)
-
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "CONSOLE ERROR: Backend connection failed: %v\n", err)
 		s.logger.Error("Failed to connect to SIP backend",
 			zap.String("clientID", client.ID),
 			zap.String("backendURL", backendURL),
-			zap.Error(err))
-
-		// Enhanced error logging to help diagnose handshake failures
+			zap.Error(err),
+		)
+		// Enhanced error logging
 		if resp != nil {
 			s.logger.Error("Backend response details",
 				zap.Int("statusCode", resp.StatusCode),
 				zap.String("status", resp.Status),
-				zap.Any("headers", resp.Header))
+				zap.Any("headers", resp.Header),
+			)
 		}
-		return // This will close the client connection
+		return // will close the client connection
 	}
 
 	// Store the backend connection
@@ -489,10 +490,11 @@ func (s *Server) handleClient(ctx context.Context, client *ClientConnection, sip
 
 	s.logger.Info("Established backend connection",
 		zap.String("clientID", client.ID),
-		zap.String("backendURL", backendURL))
+		zap.String("backendURL", backendURL),
+	)
 
 	//-------------------------------------------------------------------
-	// 1) Keepalive: SIP OPTIONS to the Client
+	// 1) Keepalive: SIP OPTIONS to the WebSocket client
 	//-------------------------------------------------------------------
 	clientOptionsTicker := time.NewTicker(30 * time.Second)
 	defer clientOptionsTicker.Stop()
@@ -504,11 +506,13 @@ func (s *Server) handleClient(ctx context.Context, client *ClientConnection, sip
 			select {
 			case <-ctx.Done():
 				s.logger.Debug("Keepalive routine stopping - context done",
-					zap.String("client", client.ID))
+					zap.String("client", client.ID),
+				)
 				return
 			case <-client.clientDone:
 				s.logger.Debug("Keepalive routine stopping - client done",
-					zap.String("client", client.ID))
+					zap.String("client", client.ID),
+				)
 				return
 			case <-clientOptionsTicker.C:
 				// Build & send SIP OPTIONS to the WebSocket client
@@ -519,18 +523,19 @@ func (s *Server) handleClient(ctx context.Context, client *ClientConnection, sip
 					client.closeMu.Unlock()
 					return
 				}
-
 				if err := client.Conn.WriteMessage(websocket.TextMessage, []byte(optionsMsg)); err != nil {
 					s.logger.Debug("Failed to send SIP OPTIONS keepalive to client",
 						zap.String("error", err.Error()),
-						zap.String("client", client.ID))
+						zap.String("client", client.ID),
+					)
 					client.closeMu.Unlock()
 					return
 				}
 				client.closeMu.Unlock()
 
 				s.logger.Debug("Sent SIP OPTIONS keepalive to client",
-					zap.String("client", client.ID))
+					zap.String("client", client.ID),
+				)
 			}
 		}
 	}()
@@ -547,7 +552,8 @@ func (s *Server) handleClient(ctx context.Context, client *ClientConnection, sip
 			select {
 			case <-ctx.Done():
 				s.logger.Debug("Client reader stopping - context done",
-					zap.String("client", client.ID))
+					zap.String("client", client.ID),
+				)
 				return
 			default:
 				// Read message with a reasonable deadline
@@ -556,11 +562,13 @@ func (s *Server) handleClient(ctx context.Context, client *ClientConnection, sip
 				if err != nil {
 					if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
 						s.logger.Debug("Client closed connection normally",
-							zap.String("client", client.ID))
+							zap.String("client", client.ID),
+						)
 					} else {
 						s.logger.Debug("WebSocket read error",
 							zap.String("client", client.ID),
-							zap.Error(err))
+							zap.Error(err),
+						)
 						errChan <- fmt.Errorf("client read: %w", err)
 					}
 					return
@@ -573,7 +581,8 @@ func (s *Server) handleClient(ctx context.Context, client *ClientConnection, sip
 				s.logger.Debug("Received message from client",
 					zap.String("client", client.ID),
 					zap.String("msgType", msgTypeStr),
-					zap.Int("length", len(msg)))
+					zap.Int("length", len(msg)),
+				)
 
 				// Forward to backend if it exists
 				if client.BackendConn != nil {
@@ -581,39 +590,41 @@ func (s *Server) handleClient(ctx context.Context, client *ClientConnection, sip
 					if err != nil {
 						s.logger.Error("Failed to forward message to backend",
 							zap.String("client", client.ID),
-							zap.Error(err))
+							zap.Error(err),
+						)
 						errChan <- fmt.Errorf("backend write: %w", err)
 						return
 					}
 					s.logger.Debug("Forwarded message to backend",
 						zap.String("client", client.ID),
 						zap.String("backend", client.BackendAddr),
-						zap.Int("length", len(msg)))
+						zap.Int("length", len(msg)),
+					)
 				}
 
-				// Process the message
+				// Process the message if SIP
 				if msgType == websocket.TextMessage || msgType == websocket.BinaryMessage {
-					// Try to parse as SIP message
 					sipMsg, err := sip.ParseMessage(msg)
 					if err == nil {
 						// Extract SIP address if available
 						if req, ok := sipMsg.(*sip.Request); ok {
 							if req.From() != nil {
 								client.SIPAddress = req.From().Address.String()
-
-								// Handle specific SIP messages
-								if s.handler != nil {
-									// Create virtual address for the client
+								// --------------------------------------------
+								// Only call handler if NOT disabled
+								// --------------------------------------------
+								if s.handler != nil && !s.config.DisableSIPProcessing {
+									// create virtual address for the client
 									addr := &websocketAddr{
 										clientID: client.ID,
 										network:  sipTransport,
 										address:  client.RemoteAddr,
 									}
-
 									if err := s.handler.HandleMessage(sipMsg, addr); err != nil {
 										s.logger.Error("SIP handler error",
 											zap.String("clientID", client.ID),
-											zap.Error(err))
+											zap.Error(err),
+										)
 									}
 								}
 							}
@@ -636,26 +647,30 @@ func (s *Server) handleClient(ctx context.Context, client *ClientConnection, sip
 			select {
 			case <-ctx.Done():
 				s.logger.Debug("Backend reader stopping - context done",
-					zap.String("client", client.ID))
+					zap.String("client", client.ID),
+				)
 				return
 			case <-client.clientDone:
 				s.logger.Debug("Backend reader stopping - client done",
-					zap.String("client", client.ID))
+					zap.String("client", client.ID),
+				)
 				return
 			default:
-				// Read message from backend with a reasonable deadline
+				// Read message from backend
 				client.BackendConn.SetReadDeadline(time.Now().Add(2 * time.Hour))
 				msgType, msg, err := client.BackendConn.ReadMessage()
 				if err != nil {
 					if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
 						s.logger.Debug("Backend closed connection normally",
 							zap.String("client", client.ID),
-							zap.String("backend", client.BackendAddr))
+							zap.String("backend", client.BackendAddr),
+						)
 					} else {
 						s.logger.Debug("Backend read error",
 							zap.String("client", client.ID),
 							zap.String("backend", client.BackendAddr),
-							zap.Error(err))
+							zap.Error(err),
+						)
 						errChan <- fmt.Errorf("backend read: %w", err)
 					}
 					return
@@ -667,14 +682,13 @@ func (s *Server) handleClient(ctx context.Context, client *ClientConnection, sip
 					client.closeMu.Unlock()
 					return
 				}
-
 				err = client.Conn.WriteMessage(msgType, msg)
 				client.closeMu.Unlock()
-
 				if err != nil {
 					s.logger.Debug("Failed to forward backend message to client",
 						zap.String("client", client.ID),
-						zap.Error(err))
+						zap.Error(err),
+					)
 					errChan <- fmt.Errorf("client write: %w", err)
 					return
 				}
@@ -682,7 +696,8 @@ func (s *Server) handleClient(ctx context.Context, client *ClientConnection, sip
 				s.logger.Debug("Forwarded message from backend to client",
 					zap.String("client", client.ID),
 					zap.String("msgType", msgTypeToString(msgType)),
-					zap.Int("length", len(msg)))
+					zap.Int("length", len(msg)),
+				)
 			}
 		}
 	}()
@@ -691,12 +706,14 @@ func (s *Server) handleClient(ctx context.Context, client *ClientConnection, sip
 	select {
 	case <-ctx.Done():
 		s.logger.Debug("Context done, closing WebSocket",
-			zap.String("client", client.ID))
+			zap.String("client", client.ID),
+		)
 		return
 	case err := <-errChan:
 		s.logger.Debug("WebSocket error, closing connection",
 			zap.String("client", client.ID),
-			zap.Error(err))
+			zap.Error(err),
+		)
 		return
 	}
 }
@@ -720,6 +737,7 @@ func (a *websocketAddr) String() string {
 func (s *Server) SendMessage(ctx context.Context, clientID string, msg []byte) error {
 	ctx, cancel := common.QuickTimeout(context.Background())
 	defer cancel()
+
 	s.mu.RLock()
 	client, ok := s.connections[clientID]
 	s.mu.RUnlock()
@@ -773,7 +791,8 @@ func (s *Server) PrepareForFailover() {
 			if err != nil {
 				s.logger.Warn("Failed to send failover notification",
 					zap.String("clientID", client.ID),
-					zap.Error(err))
+					zap.Error(err),
+				)
 			}
 		}
 		client.closeMu.Unlock()
@@ -814,7 +833,7 @@ func (s *Server) RedirectClient(clientID string, newServerAddr string) error {
 	return client.Conn.WriteMessage(websocket.TextMessage, jsonBytes)
 }
 
-// StartHealthMonitoring begins monitoring this websocket server's health
+// StartHealthMonitoring begins monitoring this WebSocket server's health
 func (s *Server) StartHealthMonitoring(ctx context.Context) {
 	s.registry.Go("ws-health-monitor", func(ctx context.Context) {
 		ticker := time.NewTicker(10 * time.Second)
@@ -830,7 +849,7 @@ func (s *Server) StartHealthMonitoring(ctx context.Context) {
 				connectionCount := len(s.connections)
 				s.mu.RUnlock()
 
-				// Store health info in storage for other instances to see
+				// Store health info in storage for other instances
 				healthData := map[string]interface{}{
 					"addr":        s.config.BindAddr,
 					"connections": connectionCount,
@@ -844,7 +863,6 @@ func (s *Server) StartHealthMonitoring(ctx context.Context) {
 					continue
 				}
 
-				// Store in persistent storage with hostname as key
 				hostname, _ := os.Hostname()
 				healthKey := fmt.Sprintf("ws-health:%s", hostname)
 
@@ -869,21 +887,21 @@ func (s *Server) closeConnection(client *ClientConnection) {
 	}
 	client.closed = true
 
-	// Cancel the connection context if it exists
+	// Cancel the connection context
 	if client.cancelFunc != nil {
 		client.cancelFunc()
 	}
 
 	client.closeMu.Unlock()
 
-	// Send close message with reason
+	// Send close message
 	closeMsg := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "Connection closed")
 	client.Conn.WriteControl(websocket.CloseMessage, closeMsg, time.Now().Add(5*time.Second))
 
 	// Close the WebSocket
 	client.Conn.Close()
 
-	// Close backend connection if exists
+	// Close backend connection
 	if client.BackendConn != nil {
 		client.BackendConn.WriteControl(websocket.CloseMessage, closeMsg, time.Now().Add(5*time.Second))
 		client.BackendConn.Close()
@@ -900,7 +918,8 @@ func (s *Server) closeConnection(client *ClientConnection) {
 
 	s.logger.Info("WebSocket connection closed",
 		zap.String("clientID", client.ID),
-		zap.String("remoteAddr", client.RemoteAddr))
+		zap.String("remoteAddr", client.RemoteAddr),
+	)
 }
 
 // closeAllConnections closes all active connections
@@ -913,7 +932,8 @@ func (s *Server) closeAllConnections() {
 	s.mu.Unlock()
 
 	s.logger.Info("Closing all WebSocket connections",
-		zap.Int("connectionCount", len(clients)))
+		zap.Int("connectionCount", len(clients)),
+	)
 
 	for _, client := range clients {
 		s.closeConnection(client)
@@ -939,12 +959,13 @@ func (s *Server) cleanConnections() {
 		s.logger.Warn("Closing inactive WebSocket connection",
 			zap.String("clientID", client.ID),
 			zap.Time("lastActivity", client.LastActivity),
-			zap.Duration("inactive", now.Sub(client.LastActivity)))
+			zap.Duration("inactive", now.Sub(client.LastActivity)),
+		)
 		s.closeConnection(client)
 	}
 }
 
-// SIP OPTIONS message generators
+// buildSipOptionsKeepAlive generates a SIP OPTIONS message for keepalive
 func (s *Server) buildSipOptionsKeepAlive(clientAddr string, serverName string) string {
 	callID := fmt.Sprintf("keepalive-%d", time.Now().UnixNano())
 	branch := fmt.Sprintf("z9hG4bK-%d", time.Now().UnixNano())
@@ -975,7 +996,7 @@ Content-Length: 0
 	)
 }
 
-// Convert WebSocket message type to string for logging
+// msgTypeToString returns a string for the WebSocket message type
 func msgTypeToString(mt int) string {
 	switch mt {
 	case websocket.TextMessage:
