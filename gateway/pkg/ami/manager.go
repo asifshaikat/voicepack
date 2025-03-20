@@ -1,10 +1,10 @@
-// pkg/ami/manager.go
 package ami
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -18,18 +18,23 @@ import (
 
 // Manager handles multiple AMI clients with failover
 type Manager struct {
-	clients     []*AMIClient
-	activeIdx   int32
-	mu          sync.RWMutex
-	logger      *zap.Logger
-	registry    *common.GoroutineRegistry
-	storage     storage.StateStorage
-	coordinator *coordinator.Coordinator
+	clients      []*AMIClient
+	activeIdx    int32
+	mu           sync.RWMutex
+	logger       *zap.Logger
+	registry     *common.GoroutineRegistry
+	storage      storage.StateStorage
+	coordinator  *coordinator.Coordinator
+	maxRetries   int
+	retryDelay   time.Duration
+	initializing int32 // atomic flag to track initialization state
 }
 
 // ManagerConfig holds the configuration for the AMI manager
 type ManagerConfig struct {
-	Clients []Config `json:"clients"`
+	Clients    []Config `json:"clients"`
+	MaxRetries int      `json:"max_retries"`
+	RetryDelay string   `json:"retry_delay"`
 }
 
 // NewManager creates a new AMI manager
@@ -65,38 +70,68 @@ func NewManager(config ManagerConfig, logger *zap.Logger, registry *common.Gorou
 		return nil, errors.New("all AMI clients failed to initialize")
 	}
 
+	// Set default values for retry parameters
+	maxRetries := 5
+	if config.MaxRetries > 0 {
+		maxRetries = config.MaxRetries
+	}
+
+	retryDelay := 5 * time.Second
+	if config.RetryDelay != "" {
+		if parsedDelay, err := time.ParseDuration(config.RetryDelay); err == nil && parsedDelay > 0 {
+			retryDelay = parsedDelay
+		}
+	}
+
 	return &Manager{
 		clients:     clients,
 		logger:      logger,
 		registry:    registry,
 		storage:     storage,
-		coordinator: coord, // Store the passed coordinator
+		coordinator: coord,
+		maxRetries:  maxRetries,
+		retryDelay:  retryDelay,
 	}, nil
 }
 
 // Start connects to the primary AMI server and starts health checks
+// This method is non-blocking and continues application startup even if AMI connection fails
 func (m *Manager) Start(ctx context.Context) error {
-	// Connect to the primary client
-	if err := m.clients[0].Connect(ctx); err != nil {
-		m.logger.Error("Failed to connect to primary AMI",
-			zap.String("address", m.clients[0].address),
-			zap.Error(err))
+	// Set initializing flag
+	atomic.StoreInt32(&m.initializing, 1)
+	defer atomic.StoreInt32(&m.initializing, 0)
 
-		// Try to connect to backup clients
+	// Start connection in background for primary client
+	m.logger.Info("Starting non-blocking AMI connection",
+		zap.String("address", m.clients[0].address))
+
+	// Use non-blocking connection
+	m.clients[0].ConnectNonBlocking(ctx)
+
+	// Wait briefly for banner
+	bannerReceived := m.clients[0].WaitForBanner(3 * time.Second)
+
+	if bannerReceived {
+		m.logger.Info("AMI banner received from primary server, continuing startup",
+			zap.String("address", m.clients[0].address))
+	} else {
+		m.logger.Warn("AMI initial connection not completed quickly, continuing startup",
+			zap.String("address", m.clients[0].address))
+
+		// Try backup clients for quick connection
 		for i := 1; i < len(m.clients); i++ {
-			if err := m.clients[i].Connect(ctx); err != nil {
-				m.logger.Error("Failed to connect to backup AMI",
-					zap.String("address", m.clients[i].address),
-					zap.Error(err))
-				continue
+			m.clients[i].ConnectNonBlocking(ctx)
+			if m.clients[i].WaitForBanner(1 * time.Second) {
+				// Got a banner from backup, switch to it
+				atomic.StoreInt32(&m.activeIdx, int32(i))
+				m.logger.Info("Connected to backup AMI (banner received)",
+					zap.String("address", m.clients[i].address))
+				break
 			}
-
-			// Connected successfully, set as active
-			atomic.StoreInt32(&m.activeIdx, int32(i))
-			m.logger.Info("Connected to backup AMI",
-				zap.String("address", m.clients[i].address))
-			break
 		}
+
+		// Start retry loop in background for all clients that aren't connected
+		go m.retryAllConnections(ctx)
 	}
 
 	// Start health checks for each client
@@ -111,6 +146,11 @@ func (m *Manager) Start(ctx context.Context) error {
 				case <-ctx.Done():
 					return
 				case <-ticker.C:
+					if !client.IsConnected() {
+						// Skip health check if not connected
+						continue
+					}
+
 					if err := client.Ping(); err != nil {
 						m.logger.Warn("AMI health check failed",
 							zap.String("address", client.address),
@@ -129,10 +169,152 @@ func (m *Manager) Start(ctx context.Context) error {
 		})
 	}
 
-	// Register for events on all clients
+	// Register event handlers
 	m.registerEventHandlers()
 
+	// Start connection monitor to handle reconnections
+	m.registry.Go("ami-connection-monitor", func(ctx context.Context) {
+		m.monitorConnections(ctx)
+	})
+
 	return nil
+}
+
+// retryAllConnections attempts to connect to all AMI servers that aren't connected
+func (m *Manager) retryAllConnections(ctx context.Context) {
+	baseDelay := m.retryDelay
+
+	for i, client := range m.clients {
+		i, client := i, client // Capture loop variables
+
+		// Skip clients that are already connected
+		if client.IsConnected() {
+			continue
+		}
+
+		go func() {
+			retryCount := 0
+
+			for retryCount < m.maxRetries {
+				// Skip if already connected
+				if client.IsConnected() {
+					return
+				}
+
+				// Calculate backoff delay
+				delay := time.Duration(float64(baseDelay) * math.Pow(1.5, float64(retryCount)))
+				if delay > 2*time.Minute {
+					delay = 2 * time.Minute // Cap at 2 minutes
+				}
+
+				m.logger.Info("Retrying AMI connection",
+					zap.String("address", client.address),
+					zap.Int("attempt", retryCount+1),
+					zap.Duration("delay", delay))
+
+				// Wait before retry
+				select {
+				case <-ctx.Done():
+					return // Context cancelled
+				case <-time.After(delay):
+					// Continue with retry
+				}
+
+				// Try to connect
+				err := client.Reconnect(ctx)
+				if err != nil {
+					retryCount++
+					m.logger.Error("AMI reconnection failed",
+						zap.String("address", client.address),
+						zap.Error(err),
+						zap.Int("retryCount", retryCount))
+				} else {
+					m.logger.Info("AMI reconnection successful",
+						zap.String("address", client.address),
+						zap.Int("attempts", retryCount+1))
+
+					// If this is the first client and no other active client,
+					// make this the active client
+					if i == 0 && atomic.LoadInt32(&m.activeIdx) == 0 {
+						// This is the primary and we reconnected it
+						return
+					}
+
+					// Check if we should make this the active client
+					activeIdx := atomic.LoadInt32(&m.activeIdx)
+					if !m.clients[activeIdx].IsConnected() {
+						// Current active client is not connected, switch to this one
+						atomic.StoreInt32(&m.activeIdx, int32(i))
+						m.logger.Info("Switched to newly connected AMI client",
+							zap.String("address", client.address))
+					}
+					return
+				}
+			}
+
+			m.logger.Warn("Maximum AMI reconnection attempts reached",
+				zap.String("address", client.address),
+				zap.Int("maxRetries", m.maxRetries))
+		}()
+	}
+}
+
+// monitorConnections monitors the connection status of all clients
+func (m *Manager) monitorConnections(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			activeIdx := atomic.LoadInt32(&m.activeIdx)
+
+			// Check if active client is connected
+			if !m.clients[activeIdx].IsConnected() {
+				m.logger.Warn("Active AMI client disconnected, looking for alternative",
+					zap.String("address", m.clients[activeIdx].address))
+
+				// Find a connected client to switch to
+				foundConnected := false
+				for i, client := range m.clients {
+					if i != int(activeIdx) && client.IsConnected() {
+						atomic.StoreInt32(&m.activeIdx, int32(i))
+						m.logger.Info("Switched to connected AMI client",
+							zap.String("from", m.clients[activeIdx].address),
+							zap.String("to", client.address))
+						foundConnected = true
+						break
+					}
+				}
+
+				if !foundConnected {
+					// No connected clients, try to reconnect them all
+					for i, client := range m.clients {
+						i, client := i, client // Capture loop variables
+						go func() {
+							connCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+							defer cancel()
+							if err := client.Reconnect(connCtx); err != nil {
+								m.logger.Debug("Reconnection attempt failed",
+									zap.String("address", client.address),
+									zap.Error(err))
+							} else {
+								m.logger.Info("Reconnected AMI client",
+									zap.String("address", client.address))
+								if !foundConnected {
+									// First successful reconnect, make it active
+									atomic.StoreInt32(&m.activeIdx, int32(i))
+									foundConnected = true
+								}
+							}
+						}()
+					}
+				}
+			}
+		}
+	}
 }
 
 // tryReconnectOrFailover attempts to reconnect to the current AMI or failover to a backup
@@ -140,7 +322,7 @@ func (m *Manager) tryReconnectOrFailover(ctx context.Context, currentIdx int) {
 	// Try to reconnect first
 	ctx, cancel := common.ContextWithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	if err := m.clients[currentIdx].Connect(ctx); err != nil {
+	if err := m.clients[currentIdx].Reconnect(ctx); err != nil {
 		m.logger.Error("Failed to reconnect to AMI",
 			zap.String("address", m.clients[currentIdx].address),
 			zap.Error(err))
@@ -323,10 +505,19 @@ func (m *Manager) GetActiveClient() *AMIClient {
 	return m.clients[idx]
 }
 
+// IsConnected returns whether the active AMI client is connected
+func (m *Manager) IsConnected() bool {
+	// During initialization phase, return true to allow startup to continue
+	if atomic.LoadInt32(&m.initializing) == 1 {
+		return true
+	}
+
+	client := m.GetActiveClient()
+	return client != nil && client.IsConnected()
+}
+
 // SendAction sends an action to the active AMI client with failover
 func (m *Manager) SendAction(action map[string]string) (map[string]string, error) {
-	//ctx, cancel := common.QuickTimeout(context.Background())
-	//defer cancel()
 	// Add ActionID if not present
 	if _, ok := action["ActionID"]; !ok {
 		action["ActionID"] = fmt.Sprintf("AMI-%d", time.Now().UnixNano())
@@ -348,6 +539,22 @@ func (m *Manager) SendAction(action map[string]string) (map[string]string, error
 
 	// Get the active client
 	client := m.GetActiveClient()
+
+	// Check if client is connected
+	if !client.IsConnected() {
+		// Try to connect first
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		if err := client.Connect(ctx); err != nil {
+			m.logger.Warn("Active AMI client not connected and reconnection failed",
+				zap.String("address", client.address),
+				zap.Error(err))
+
+			// Try failover
+			return m.failoverAction(context.Background(), action)
+		}
+	}
 
 	// Send the action
 	response, err := client.SendAction(action)
@@ -485,6 +692,37 @@ func (m *Manager) Hangup(channel, cause string) (map[string]string, error) {
 	}
 
 	return m.SendAction(action)
+}
+
+// Reconnect attempts to reconnect all clients
+func (m *Manager) Reconnect() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// First try to reconnect active client
+	activeIdx := atomic.LoadInt32(&m.activeIdx)
+	if err := m.clients[activeIdx].Reconnect(ctx); err == nil {
+		m.logger.Info("Reconnected active AMI client",
+			zap.String("address", m.clients[activeIdx].address))
+		return nil
+	}
+
+	// Try all other clients
+	for i, client := range m.clients {
+		if i == int(activeIdx) {
+			continue // Skip active client, we already tried it
+		}
+
+		if err := client.Reconnect(ctx); err == nil {
+			// Successfully reconnected this client, make it active
+			atomic.StoreInt32(&m.activeIdx, int32(i))
+			m.logger.Info("Reconnected and switched to backup AMI client",
+				zap.String("address", client.address))
+			return nil
+		}
+	}
+
+	return errors.New("failed to reconnect any AMI client")
 }
 
 // Shutdown closes all AMI connections

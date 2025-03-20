@@ -3,8 +3,8 @@ module gateway
 go 1.24.0
 
 require (
+	github.com/emiago/sipgo v0.30.0
 	github.com/gorilla/websocket v1.5.3
-	github.com/jart/gosip v0.0.0-20220818224804-29801cedf805
 	github.com/prometheus/client_golang v1.21.1
 	go.uber.org/zap v1.27.0
 	gopkg.in/yaml.v3 v3.0.1
@@ -13,7 +13,6 @@ require (
 require (
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
-	github.com/emiago/sipgo v0.30.0 // indirect
 	github.com/gobwas/httphead v0.1.0 // indirect
 	github.com/gobwas/pool v0.2.1 // indirect
 	github.com/gobwas/ws v1.3.2 // indirect

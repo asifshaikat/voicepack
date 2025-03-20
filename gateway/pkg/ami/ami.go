@@ -24,6 +24,7 @@ type AMIClient struct {
 	conn           net.Conn
 	mu             sync.Mutex
 	connected      bool
+	bannerReceived bool
 	responseChans  map[string]chan map[string]string
 	eventHandlers  map[string][]func(event map[string]string)
 	eventChan      chan map[string]string
@@ -31,6 +32,7 @@ type AMIClient struct {
 	logger         *zap.Logger
 	stopChan       chan struct{}
 	doneChan       chan struct{}
+	connectedChan  chan bool
 }
 
 // Config holds the configuration for an AMI client
@@ -83,6 +85,7 @@ func New(config Config, logger *zap.Logger) (*AMIClient, error) {
 		logger:         logger,
 		stopChan:       make(chan struct{}),
 		doneChan:       make(chan struct{}),
+		connectedChan:  make(chan bool, 1),
 	}
 
 	return client, nil
@@ -97,6 +100,48 @@ func (c *AMIClient) Connect(ctx context.Context) error {
 		return nil
 	}
 
+	return c.connectLocked(ctx)
+}
+
+// ConnectNonBlocking initiates a connection in the background and returns immediately
+// It signals success through the connectedChan when the banner is received
+func (c *AMIClient) ConnectNonBlocking(ctx context.Context) {
+	// Reset the connected channel in case it was previously used
+	select {
+	case <-c.connectedChan:
+		// Drain the channel
+	default:
+		// Channel empty, continue
+	}
+
+	c.mu.Lock()
+	if c.connected {
+		// Already connected, send success signal
+		c.mu.Unlock()
+		c.connectedChan <- true
+		return
+	}
+	c.mu.Unlock()
+
+	// Connect in background
+	go func() {
+		err := c.Connect(ctx)
+		if err != nil {
+			c.logger.Error("Background AMI connection failed",
+				zap.String("address", c.address),
+				zap.Error(err))
+
+			// Signal failure if the channel isn't already filled
+			select {
+			case c.connectedChan <- false:
+			default:
+			}
+		}
+	}()
+}
+
+// connectLocked is the internal connection method (must be called with lock held)
+func (c *AMIClient) connectLocked(ctx context.Context) error {
 	if !c.circuitBreaker.AllowRequest() {
 		return fmt.Errorf("circuit breaker open for AMI %s", c.address)
 	}
@@ -131,24 +176,46 @@ func (c *AMIClient) Connect(ctx context.Context) error {
 		zap.String("address", c.address),
 		zap.String("banner", strings.TrimSpace(banner)))
 
+	// Signal banner reception for early success detection
+	c.bannerReceived = true
+	select {
+	case c.connectedChan <- true:
+		// Signal sent successfully
+	default:
+		// Channel is full or closed, continue anyway
+	}
+
+	// Reset read deadline
+	conn.SetReadDeadline(time.Time{})
+
 	// Start reading responses and events
 	go c.readLoop()
 
 	// Login to AMI
-	loginResponse, err := c.SendAction(map[string]string{
+	// In connectLocked method, update this section:
+	// Login to AMI
+	loginResponse, err := c.sendActionLocked(map[string]string{
 		"Action":   "Login",
 		"Username": c.username,
 		"Secret":   c.secret,
 	})
 
 	if err != nil {
-		c.closeConn()
+		// Critical change here: close connection BEFORE setting c.conn to nil
+		if c.conn != nil {
+			c.conn.Close()
+			c.conn = nil
+		}
 		c.circuitBreaker.RecordFailure()
 		return fmt.Errorf("AMI login failed: %w", err)
 	}
 
 	if loginResponse["Response"] != "Success" {
-		c.closeConn()
+		// Same here: close connection BEFORE setting c.conn to nil
+		if c.conn != nil {
+			c.conn.Close()
+			c.conn = nil
+		}
 		c.circuitBreaker.RecordFailure()
 		return fmt.Errorf("AMI login failed: %s", loginResponse["Message"])
 	}
@@ -168,6 +235,7 @@ func (c *AMIClient) closeConn() {
 		c.conn.Close()
 		c.conn = nil
 	}
+	c.bannerReceived = false
 }
 
 // Disconnect closes the connection to the Asterisk server
@@ -201,6 +269,63 @@ func (c *AMIClient) Disconnect() {
 
 	// Wait for the dispatcher to finish
 	<-c.doneChan
+}
+
+// Reconnect attempts to reestablish connection after disconnect
+func (c *AMIClient) Reconnect(ctx context.Context) error {
+	c.mu.Lock()
+
+	// If we're already connected, nothing to do
+	if c.connected {
+		c.mu.Unlock()
+		return nil
+	}
+
+	// Make sure any existing connection is properly closed
+	if c.conn != nil {
+		c.conn.Close()
+		c.conn = nil
+	}
+
+	c.bannerReceived = false
+
+	// Reset the connected channel
+	select {
+	case <-c.connectedChan:
+		// Drain the channel
+	default:
+		// Channel empty, continue
+	}
+
+	// Release the lock and try to reconnect
+	c.mu.Unlock()
+
+	// Try to reconnect
+	return c.Connect(ctx)
+}
+
+// IsConnected returns true if the client is fully connected
+func (c *AMIClient) IsConnected() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.connected
+}
+
+// IsBannerReceived returns true if at least a banner was received
+func (c *AMIClient) IsBannerReceived() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.bannerReceived
+}
+
+// WaitForBanner waits for the banner to be received or timeout
+func (c *AMIClient) WaitForBanner(timeout time.Duration) bool {
+	select {
+	case result := <-c.connectedChan:
+		return result
+	case <-time.After(timeout):
+		return false
+	}
 }
 
 // eventDispatcher dispatches events to registered handlers
@@ -245,89 +370,12 @@ func (c *AMIClient) SendAction(action map[string]string) (map[string]string, err
 	defer c.mu.Unlock()
 
 	if !c.connected {
-		if err := c.connectLocked(); err != nil {
+		if err := c.connectLocked(context.Background()); err != nil {
 			return nil, fmt.Errorf("not connected: %w", err)
 		}
 	}
 
 	return c.sendActionLocked(action)
-}
-
-// connectLocked connects to Asterisk (must be called with lock held)
-func (c *AMIClient) connectLocked() error {
-	if c.connected {
-		return nil
-	}
-
-	if !c.circuitBreaker.AllowRequest() {
-		return fmt.Errorf("circuit breaker open for AMI %s", c.address)
-	}
-
-	// Connect to AMI
-	conn, err := net.DialTimeout("tcp", c.address, c.timeout)
-	if err != nil {
-		c.circuitBreaker.RecordFailure()
-		return fmt.Errorf("failed to connect to AMI: %w", err)
-	}
-
-	c.conn = conn
-
-	// Set deadline for initial banner
-	conn.SetReadDeadline(time.Now().Add(c.timeout))
-
-	// Read the banner
-	reader := bufio.NewReader(conn)
-	banner, err := reader.ReadString('\n')
-	if err != nil {
-		conn.Close()
-		c.conn = nil
-		c.circuitBreaker.RecordFailure()
-		return fmt.Errorf("failed to read AMI banner: %w", err)
-	}
-
-	c.logger.Debug("Connected to Asterisk",
-		zap.String("address", c.address),
-		zap.String("banner", strings.TrimSpace(banner)))
-
-	// Start reading responses and events
-	go c.readLoop()
-
-	// Login to AMI
-	loginResponse, err := c.sendActionLocked(map[string]string{
-		"Action":   "Login",
-		"Username": c.username,
-		"Secret":   c.secret,
-	})
-
-	if err != nil {
-		conn.Close()
-		c.conn = nil
-		c.circuitBreaker.RecordFailure()
-		return fmt.Errorf("AMI login failed: %w", err)
-	}
-
-	if loginResponse["Response"] != "Success" {
-		conn.Close()
-		c.conn = nil
-		c.circuitBreaker.RecordFailure()
-		return fmt.Errorf("AMI login failed: %s", loginResponse["Message"])
-	}
-
-	c.connected = true
-	c.circuitBreaker.RecordSuccess()
-
-	// Start event dispatcher if it's not already running
-	select {
-	case <-c.doneChan:
-		// Dispatcher is not running, start it
-		c.stopChan = make(chan struct{})
-		c.doneChan = make(chan struct{})
-		go c.eventDispatcher()
-	default:
-		// Dispatcher is already running
-	}
-
-	return nil
 }
 
 // sendActionLocked sends an action to Asterisk and waits for a response (must be called with lock held)
@@ -390,7 +438,11 @@ func (c *AMIClient) readLoop() {
 	defer func() {
 		c.mu.Lock()
 		c.connected = false
-		c.conn = nil
+		// Don't set c.conn to nil here, just close it
+		if c.conn != nil {
+			c.conn.Close()
+		}
+
 		// Close all response channels
 		for id, ch := range c.responseChans {
 			close(ch)
@@ -399,22 +451,58 @@ func (c *AMIClient) readLoop() {
 		c.mu.Unlock()
 	}()
 
-	reader := bufio.NewReader(c.conn)
+	// Create a recovered wrapper to prevent panics from killing the application
+	defer func() {
+		if r := recover(); r != nil {
+			c.logger.Error("Recovered from panic in AMI readLoop",
+				zap.Any("error", r))
+		}
+	}()
+
+	// Create a local reader to avoid nil pointer issues
+	var reader *bufio.Reader
+
+	// Safely get the connection and create a reader
+	c.mu.Lock()
+	if c.conn == nil {
+		c.mu.Unlock()
+		c.logger.Error("AMI connection is nil in readLoop")
+		return
+	}
+	reader = bufio.NewReader(c.conn)
+	c.mu.Unlock()
 
 	for {
+		// Check if connection is still valid before continuing
+		c.mu.Lock()
+		if c.conn == nil {
+			c.mu.Unlock()
+			c.logger.Debug("AMI connection closed, exiting readLoop")
+			return
+		}
+		c.mu.Unlock()
+
 		response := make(map[string]string)
 		readingMessage := true
 
 		for readingMessage {
-			// Reset read deadline for each line
+			// Safely set read deadline for each line
+			c.mu.Lock()
+			if c.conn == nil {
+				c.mu.Unlock()
+				return
+			}
 			c.conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
+			c.mu.Unlock()
 
+			// Read line with proper error handling
 			line, err := reader.ReadString('\n')
 			if err != nil {
 				c.logger.Error("AMI read error",
 					zap.String("address", c.address),
 					zap.Error(err))
-				return
+
+				return // Exit on read error
 			}
 
 			line = strings.TrimRight(line, "\r\n")

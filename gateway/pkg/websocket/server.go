@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -118,7 +119,6 @@ func NewServer(config ServerConfig, storage storage.StateStorage, logger *zap.Lo
 			},
 			Subprotocols: []string{"sip"},
 		},
-		// In pkg/websocket/server.go, update the code to:
 		circuitBreaker: common.NewCircuitBreaker("websocket", common.CircuitBreakerConfig{
 			FailureThreshold: 5,
 			ResetTimeout:     30 * time.Second,
@@ -136,8 +136,15 @@ func (s *Server) SetSIPHandler(handler SIPHandler) {
 
 // Start starts the WebSocket server
 func (s *Server) Start(ctx context.Context) error {
+	s.logger.Info("Starting WebSocket server",
+		zap.String("bindAddr", s.config.BindAddr),
+		zap.Bool("tlsEnabled", s.config.CertFile != "" && s.config.KeyFile != ""),
+		zap.String("backendServer", s.config.ServerName))
+
 	mux := http.NewServeMux()
-	mux.HandleFunc("/ws", s.handleWebSocket)
+	mux.HandleFunc("/", s.handleWebSocket)
+
+	s.logger.Debug("Registered WebSocket handler at root path (/)")
 
 	s.httpServer = &http.Server{
 		Addr:         s.config.BindAddr,
@@ -146,18 +153,27 @@ func (s *Server) Start(ctx context.Context) error {
 		WriteTimeout: s.config.WriteTimeout,
 		IdleTimeout:  s.config.IdleTimeout,
 	}
-	// Start connection health monitoring
 
-	// Start connection cleaner
+	s.logger.Debug("HTTP server configured",
+		zap.String("bindAddr", s.config.BindAddr),
+		zap.Duration("readTimeout", s.config.ReadTimeout),
+		zap.Duration("writeTimeout", s.config.WriteTimeout),
+		zap.Duration("idleTimeout", s.config.IdleTimeout))
+
+	// Start connection health monitoring and cleaner
 	s.registry.Go("connection-cleaner", func(ctx context.Context) {
+		s.logger.Debug("Connection cleaner goroutine started")
 		ticker := time.NewTicker(5 * time.Minute)
 		defer ticker.Stop()
 		s.StartHealthMonitoring(ctx)
+
 		for {
 			select {
 			case <-ctx.Done():
+				s.logger.Debug("Connection cleaner shutting down: context canceled")
 				return
 			case <-ticker.C:
+				s.logger.Debug("Running scheduled connection cleanup")
 				s.cleanConnections()
 			}
 		}
@@ -165,74 +181,94 @@ func (s *Server) Start(ctx context.Context) error {
 
 	// Start the HTTP server
 	s.registry.Go("http-server", func(ctx context.Context) {
+		s.logger.Debug("Starting HTTP server goroutine")
 		var err error
 
 		// Check if we need TLS
 		if s.config.CertFile != "" && s.config.KeyFile != "" {
-			s.logger.Info("Starting WSS server with TLS",
-				zap.String("addr", s.config.BindAddr),
-				zap.String("certFile", s.config.CertFile))
+			s.logger.Debug("Using TLS configuration",
+				zap.String("certFile", s.config.CertFile),
+				zap.String("keyFile", s.config.KeyFile))
 
 			if s.config.EnableIPv4Only {
 				// Create IPv4-only listener
+				s.logger.Debug("Creating IPv4-only listener")
 				ln, err := net.Listen("tcp4", s.config.BindAddr)
 				if err != nil {
-					s.logger.Error("Failed to create IPv4 listener", zap.Error(err))
+					s.logger.Error("Failed to create IPv4 listener",
+						zap.Error(err))
 					return
 				}
 
-				s.logger.Debug("Successfully bound IPv4 listener",
-					zap.String("address", ln.Addr().String()))
+				s.logger.Debug("Successfully created IPv4 listener",
+					zap.String("localAddress", ln.Addr().String()))
 
-				// Load TLS certificate
+				s.logger.Debug("Loading TLS certificate")
 				cert, err := tls.LoadX509KeyPair(s.config.CertFile, s.config.KeyFile)
 				if err != nil {
-					s.logger.Error("Failed to load TLS certificate", zap.Error(err))
+					s.logger.Error("Failed to load TLS certificate",
+						zap.Error(err))
 					return
 				}
 
-				// Configure TLS
 				tlsConfig := &tls.Config{
 					Certificates: []tls.Certificate{cert},
 					MinVersion:   tls.VersionTLS12,
 				}
-
 				s.httpServer.TLSConfig = tlsConfig
+
+				s.logger.Info("Starting TLS server on IPv4 listener")
 				err = s.httpServer.ServeTLS(ln, "", "")
 			} else {
+				s.logger.Info("Starting TLS server with IPv4/IPv6 support")
 				err = s.httpServer.ListenAndServeTLS(s.config.CertFile, s.config.KeyFile)
 			}
 		} else {
-			s.logger.Info("Starting WS server without TLS",
-				zap.String("addr", s.config.BindAddr))
-
+			s.logger.Info("Starting non-TLS server")
 			if s.config.EnableIPv4Only {
-				// Create IPv4-only listener
+				s.logger.Debug("Creating IPv4-only listener (non-TLS)")
 				ln, err := net.Listen("tcp4", s.config.BindAddr)
 				if err != nil {
-					s.logger.Error("Failed to create IPv4 listener", zap.Error(err))
+					s.logger.Error("Failed to create IPv4 listener (non-TLS)",
+						zap.Error(err))
 					return
 				}
 
-				s.logger.Debug("Successfully bound IPv4 listener (non-TLS)",
-					zap.String("address", ln.Addr().String()))
-
+				s.logger.Debug("Starting non-TLS server on IPv4 listener")
 				err = s.httpServer.Serve(ln)
 			} else {
+				s.logger.Debug("Starting non-TLS server with IPv4/IPv6 support")
 				err = s.httpServer.ListenAndServe()
 			}
 		}
 
+		// This will execute when the server stops (either normally or with error)
 		if err != nil && err != http.ErrServerClosed {
-			s.logger.Error("HTTP server failed", zap.Error(err))
+			s.logger.Error("HTTP server failed with error",
+				zap.Error(err))
+
+			// Check for common binding errors
+			if opErr, ok := err.(*net.OpError); ok {
+				s.logger.Error("Network operation error details",
+					zap.String("op", opErr.Op),
+					zap.String("net", opErr.Net),
+					zap.Any("addr", opErr.Addr),
+					zap.Bool("timeout", opErr.Timeout()),
+					zap.Bool("temporary", opErr.Temporary()))
+			}
+		} else if err == http.ErrServerClosed {
+			s.logger.Info("WebSocket server closed normally")
 		}
 	})
 
+	s.logger.Info("WebSocket server initialization complete")
 	return nil
 }
 
 // Stop stops the WebSocket server
 func (s *Server) Stop() error {
+	s.logger.Info("Stopping WebSocket server")
+
 	// Shutdown the HTTP server
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -260,12 +296,17 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	clientAddr := r.RemoteAddr
 	s.logger.Debug("Incoming WebSocket handshake request",
 		zap.String("client", clientAddr),
-		zap.String("url", r.URL.String()))
+		zap.String("url", r.URL.String()),
+		zap.String("path", r.URL.Path),
+		zap.String("userAgent", r.UserAgent()))
 
 	// Check if we're at capacity
 	s.mu.RLock()
 	if len(s.connections) >= s.config.MaxConnections {
 		s.mu.RUnlock()
+		s.logger.Warn("Connection rejected: too many connections",
+			zap.String("client", clientAddr),
+			zap.Int("maxConnections", s.config.MaxConnections))
 		http.Error(w, "Too many connections", http.StatusServiceUnavailable)
 		return
 	}
@@ -273,6 +314,8 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	// Check circuit breaker
 	if !s.circuitBreaker.AllowRequest() {
+		s.logger.Warn("Connection rejected: circuit breaker open",
+			zap.String("client", clientAddr))
 		http.Error(w, "Service temporarily unavailable", http.StatusServiceUnavailable)
 		return
 	}
@@ -296,6 +339,8 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	// Verify it's a valid WebSocket upgrade
 	if !websocket.IsWebSocketUpgrade(r) {
+		s.logger.Warn("Not a valid WebSocket upgrade request",
+			zap.String("client", clientAddr))
 		http.Error(w, "Not a WebSocket handshake", http.StatusBadRequest)
 		return
 	}
@@ -367,7 +412,47 @@ func (s *Server) handleClient(ctx context.Context, client *ClientConnection, sip
 	defer s.closeConnection(client)
 
 	// Setup error channel
-	errChan := make(chan error, 2)
+	errChan := make(chan error, 3) // Increased buffer size to handle more potential errors
+
+	// Setup backend connection
+	s.logger.Debug("Establishing backend connection",
+		zap.String("clientID", client.ID),
+		zap.String("backendServer", s.config.ServerName))
+
+	// Parse the backend URL
+	backendURL := s.config.ServerName
+	if !strings.HasPrefix(backendURL, "ws") {
+		backendURL = "wss://" + backendURL
+	}
+
+	// Create dialer with proper TLS configuration
+	dialer := websocket.Dialer{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true, // Consider making this configurable
+		},
+		HandshakeTimeout: 10 * time.Second,
+		Subprotocols:     []string{client.Protocol}, // Use the same subprotocol as client
+	}
+	fmt.Fprintf(os.Stderr, "CONSOLE: Attempting backend connection to %s\n", backendURL)
+
+	// Connect to backend
+	backendConn, _, err := dialer.Dial(backendURL, nil)
+	fmt.Fprintf(os.Stderr, "CONSOLE ERROR: Backend connection failed: %v\n", err)
+	if err != nil {
+		s.logger.Error("Failed to connect to SIP backend",
+			zap.String("clientID", client.ID),
+			zap.String("backendURL", backendURL),
+			zap.Error(err))
+		return // This will close the client connection
+	}
+
+	// Store the backend connection
+	client.BackendConn = backendConn
+	client.BackendAddr = backendURL
+
+	s.logger.Info("Established backend connection",
+		zap.String("clientID", client.ID),
+		zap.String("backendURL", backendURL))
 
 	//-------------------------------------------------------------------
 	// 1) Keepalive: SIP OPTIONS to the Client
@@ -410,7 +495,7 @@ func (s *Server) handleClient(ctx context.Context, client *ClientConnection, sip
 	}()
 
 	//-------------------------------------------------------------------
-	// 2) Process messages from client
+	// 2) Process messages from client to backend
 	//-------------------------------------------------------------------
 	s.wg.Add(1)
 	go func() {
@@ -447,6 +532,22 @@ func (s *Server) handleClient(ctx context.Context, client *ClientConnection, sip
 					zap.String("msgType", msgTypeStr),
 					zap.Int("length", len(msg)))
 
+				// Forward to backend if it exists
+				if client.BackendConn != nil {
+					err = client.BackendConn.WriteMessage(msgType, msg)
+					if err != nil {
+						s.logger.Error("Failed to forward message to backend",
+							zap.String("client", client.ID),
+							zap.Error(err))
+						errChan <- fmt.Errorf("backend write: %w", err)
+						return
+					}
+					s.logger.Debug("Forwarded message to backend",
+						zap.String("client", client.ID),
+						zap.String("backend", client.BackendAddr),
+						zap.Int("length", len(msg)))
+				}
+
 				// Process the message
 				if msgType == websocket.TextMessage || msgType == websocket.BinaryMessage {
 					// Try to parse as SIP message
@@ -472,15 +573,69 @@ func (s *Server) handleClient(ctx context.Context, client *ClientConnection, sip
 											zap.Error(err))
 									}
 								}
-
-								// If this client has a backend connection, forward the message
-								if client.BackendConn != nil {
-									client.BackendConn.WriteMessage(msgType, msg)
-								}
 							}
 						}
 					}
 				}
+			}
+		}
+	}()
+
+	//-------------------------------------------------------------------
+	// 3) Process messages from backend to client
+	//-------------------------------------------------------------------
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		defer close(client.backendDone)
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-client.clientDone:
+				return
+			default:
+				// Read message from backend with a reasonable deadline
+				client.BackendConn.SetReadDeadline(time.Now().Add(2 * time.Hour))
+				msgType, msg, err := client.BackendConn.ReadMessage()
+				if err != nil {
+					if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+						s.logger.Debug("Backend closed connection normally",
+							zap.String("client", client.ID),
+							zap.String("backend", client.BackendAddr))
+					} else {
+						s.logger.Debug("Backend read error",
+							zap.String("client", client.ID),
+							zap.String("backend", client.BackendAddr),
+							zap.Error(err))
+						errChan <- fmt.Errorf("backend read: %w", err)
+					}
+					return
+				}
+
+				// Forward to client
+				client.closeMu.Lock()
+				if client.closed {
+					client.closeMu.Unlock()
+					return
+				}
+
+				err = client.Conn.WriteMessage(msgType, msg)
+				client.closeMu.Unlock()
+
+				if err != nil {
+					s.logger.Debug("Failed to forward backend message to client",
+						zap.String("client", client.ID),
+						zap.Error(err))
+					errChan <- fmt.Errorf("client write: %w", err)
+					return
+				}
+
+				s.logger.Debug("Forwarded message from backend to client",
+					zap.String("client", client.ID),
+					zap.String("msgType", msgTypeToString(msgType)),
+					zap.Int("length", len(msg)))
 			}
 		}
 	}()
