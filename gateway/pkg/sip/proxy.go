@@ -8,7 +8,9 @@ import (
 	"log/slog"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -52,6 +54,7 @@ func (r *Registry) Get(user string) string {
 
 // setupSipProxy builds a SIP proxy server that listens on the given ip
 // and forwards requests to proxydst if not found in the registry.
+
 func setupSipProxy(proxydst, ip string) (*sipgo.Server, *sipgo.Client, *Registry) {
 	// Use slog.Default() for simple logging.
 	log := slog.Default()
@@ -71,8 +74,9 @@ func setupSipProxy(proxydst, ip string) (*sipgo.Server, *sipgo.Client, *Registry
 		return nil, nil, nil
 	}
 
-	// Create a SIP client (for forwarding requests downstream)
-	client, err := sipgo.NewClient(ua, sipgo.WithClientAddr(ip))
+	// Create a SIP client without binding to a specific local address
+	// This allows the OS to dynamically allocate ports for outgoing connections
+	client, err := sipgo.NewClient(ua)
 	if err != nil {
 		log.Error("Failed to create client", "error", err)
 		return nil, nil, nil
@@ -282,8 +286,16 @@ func (p *Proxy) AddTransport(t Transport) {
 
 // Start starts the SIP proxy server.
 func (p *Proxy) Start(ctx context.Context) error {
-	// Adjust parameters as needed. Here we assume UDP transport.
-	return p.server.ListenAndServe(ctx, "udp", "")
+	// Start the SIP server in a background goroutine to avoid blocking
+	go func() {
+		err := p.server.ListenAndServe(ctx, "udp", "")
+		if err != nil && err != context.Canceled {
+			p.logger.Error("SIP server failed", zap.Error(err))
+		}
+	}()
+
+	// Return immediately to keep the application startup non-blocking
+	return nil
 }
 
 // Stop stops the SIP proxy server.
@@ -292,7 +304,7 @@ func (p *Proxy) Stop() error {
 }
 
 // HandleMessage implements the websocket.SIPHandler interface to process SIP messages from WebSocket connections
-// HandleMessage implements the websocket.SIPHandler interface for processing SIP messages
+
 func (p *Proxy) HandleMessage(msg Message, addr net.Addr) error {
 	clientAddr := addr.String()
 
@@ -399,20 +411,52 @@ func (p *Proxy) forwardRequest(req *Request, clientAddr string) error {
 
 	req.SetDestination(dstAddr)
 
-	// Create context for the request
-	ctx := context.Background()
+	// Create context with timeout for the request
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 
-	// Forward the request using the client
-	clTx, err := p.client.TransactionRequest(ctx, req,
-		sipgo.ClientRequestAddVia,
-		sipgo.ClientRequestAddRecordRoute,
-	)
-	if err != nil {
+	// Attempt transaction with retries
+	var clTx sip.ClientTransaction
+	var err error
+	maxRetries := 3
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		clTx, err = p.client.TransactionRequest(ctx, req,
+			sipgo.ClientRequestAddVia,
+			sipgo.ClientRequestAddRecordRoute,
+		)
+
+		if err == nil {
+			break // Success, exit retry loop
+		}
+
+		// Check if it's a binding error
+		if strings.Contains(err.Error(), "bind: address already in use") {
+			p.logger.Warn("Port binding issue, retrying",
+				zap.Int("attempt", attempt+1),
+				zap.String("client", clientAddr))
+
+			// Short delay before retry
+			time.Sleep(200 * time.Millisecond)
+			continue
+		}
+
+		// For other types of errors, don't retry
 		p.logger.Error("Failed to create client transaction for WebSocket request",
 			zap.Error(err),
 			zap.String("client", clientAddr))
 		return err
 	}
+
+	// If we exhausted all retries and still have an error
+	if err != nil {
+		p.logger.Error("Failed to create client transaction after retries",
+			zap.Error(err),
+			zap.String("client", clientAddr),
+			zap.Int("maxRetries", maxRetries))
+		return err
+	}
+
 	defer clTx.Terminate()
 
 	p.logger.Debug("Forwarded WebSocket SIP request",
@@ -420,8 +464,6 @@ func (p *Proxy) forwardRequest(req *Request, clientAddr string) error {
 		zap.String("client", clientAddr),
 		zap.String("destination", dstAddr))
 
-	// Could handle responses here, but that would require a mechanism to
-	// send responses back via WebSocket to the original sender
 	return nil
 }
 func (p *Proxy) getDestination(req *sip.Request) string {
