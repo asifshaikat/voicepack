@@ -72,6 +72,7 @@ type ClientConnection struct {
 	closeMu      sync.Mutex
 	clientDone   chan struct{}
 	backendDone  chan struct{}
+	cancelFunc   context.CancelFunc // Added to properly manage connection context
 }
 
 // NewServer creates a new WebSocket server
@@ -288,11 +289,8 @@ func (s *Server) Stop() error {
 }
 
 // handleWebSocket handles WebSocket connection requests
+// handleWebSocket handles WebSocket connection requests
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
-	// Create a request context with timeout
-	reqCtx, cancel := context.WithTimeout(r.Context(), s.config.WriteTimeout)
-	defer cancel()
-
 	clientAddr := r.RemoteAddr
 	s.logger.Debug("Incoming WebSocket handshake request",
 		zap.String("client", clientAddr),
@@ -356,7 +354,10 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// Set subprotocols in upgrader
 	s.upgrader.Subprotocols = protocols
 
-	// Upgrade the connection
+	// Set a timeout for the HTTP handler
+	r.Context().Done()
+
+	// First, upgrade the connection
 	conn, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		s.logger.Error("WebSocket upgrade failed",
@@ -366,8 +367,14 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Set a reasonable initial deadline for any pending writes
+	conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+
 	// Create a unique client ID
 	clientID := fmt.Sprintf("%s-%d", clientAddr, time.Now().UnixNano())
+
+	// Create a long-lived context for this WebSocket connection
+	wsCtx, wsCancel := context.WithCancel(context.Background())
 
 	// Create client connection
 	client := &ClientConnection{
@@ -380,6 +387,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		LastActivity: time.Now(),
 		clientDone:   make(chan struct{}),
 		backendDone:  make(chan struct{}),
+		cancelFunc:   wsCancel, // Store cancel function for cleanup
 	}
 
 	// Store the connection
@@ -397,11 +405,13 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		zap.String("protocol", client.Protocol),
 		zap.String("sipTransport", sipTransport))
 
-	// Handle the connection
+	// Handle the connection with the long-lived context in a background goroutine
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		s.handleClient(reqCtx, client, sipTransport)
+		// Remove the write deadline for the long-running connection
+		conn.SetWriteDeadline(time.Time{})
+		s.handleClient(wsCtx, client, sipTransport)
 	}()
 
 	s.circuitBreaker.RecordSuccess()
@@ -493,8 +503,12 @@ func (s *Server) handleClient(ctx context.Context, client *ClientConnection, sip
 		for {
 			select {
 			case <-ctx.Done():
+				s.logger.Debug("Keepalive routine stopping - context done",
+					zap.String("client", client.ID))
 				return
 			case <-client.clientDone:
+				s.logger.Debug("Keepalive routine stopping - client done",
+					zap.String("client", client.ID))
 				return
 			case <-clientOptionsTicker.C:
 				// Build & send SIP OPTIONS to the WebSocket client
@@ -532,6 +546,8 @@ func (s *Server) handleClient(ctx context.Context, client *ClientConnection, sip
 		for {
 			select {
 			case <-ctx.Done():
+				s.logger.Debug("Client reader stopping - context done",
+					zap.String("client", client.ID))
 				return
 			default:
 				// Read message with a reasonable deadline
@@ -619,8 +635,12 @@ func (s *Server) handleClient(ctx context.Context, client *ClientConnection, sip
 		for {
 			select {
 			case <-ctx.Done():
+				s.logger.Debug("Backend reader stopping - context done",
+					zap.String("client", client.ID))
 				return
 			case <-client.clientDone:
+				s.logger.Debug("Backend reader stopping - client done",
+					zap.String("client", client.ID))
 				return
 			default:
 				// Read message from backend with a reasonable deadline
@@ -848,6 +868,12 @@ func (s *Server) closeConnection(client *ClientConnection) {
 		return
 	}
 	client.closed = true
+
+	// Cancel the connection context if it exists
+	if client.cancelFunc != nil {
+		client.cancelFunc()
+	}
+
 	client.closeMu.Unlock()
 
 	// Send close message with reason
