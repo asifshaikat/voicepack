@@ -490,12 +490,6 @@ func (p *Proxy) handleResponse(resp *Response, clientAddr string) error {
 // Actually forward the request by creating a local SIP transaction (only if allowed).
 func (p *Proxy) forwardRequest(req *Request, clientAddr string) error {
 
-	/* 	// Hard bypass if you want to completely disable local SIP processing.
-	   	p.logger.Warn("Hard bypass in forwardRequest: skipping local SIP transaction creation",
-	   		zap.String("method", req.Method.String()),
-	   		zap.String("clientAddr", clientAddr),
-	   	)
-	   	return nil */
 	p.logger.Warn("forwardRequest called",
 		zap.String("method", req.Method.String()),
 		zap.String("clientAddr", clientAddr),
