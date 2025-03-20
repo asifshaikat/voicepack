@@ -425,6 +425,23 @@ func (s *Server) handleClient(ctx context.Context, client *ClientConnection, sip
 		backendURL = "wss://" + backendURL
 	}
 
+	// Create proper headers for backend connection
+	backendHeaders := http.Header{}
+
+	// Extract host from backend URL for Origin header
+	host := strings.Split(strings.TrimPrefix(strings.TrimPrefix(backendURL, "wss://"), "ws://"), ":")[0]
+
+	// Add essential headers for WebSocket handshake
+	backendHeaders.Add("Origin", "https://"+host)
+	backendHeaders.Add("Host", host)
+
+	// Add a User-Agent to identify your gateway
+	backendHeaders.Add("User-Agent", "QalqulVoiceGateway/1.0")
+
+	s.logger.Debug("Connecting to backend with headers",
+		zap.String("backendURL", backendURL),
+		zap.Any("headers", backendHeaders))
+
 	// Create dialer with proper TLS configuration
 	dialer := websocket.Dialer{
 		TLSClientConfig: &tls.Config{
@@ -433,16 +450,26 @@ func (s *Server) handleClient(ctx context.Context, client *ClientConnection, sip
 		HandshakeTimeout: 10 * time.Second,
 		Subprotocols:     []string{client.Protocol}, // Use the same subprotocol as client
 	}
+
 	fmt.Fprintf(os.Stderr, "CONSOLE: Attempting backend connection to %s\n", backendURL)
 
-	// Connect to backend
-	backendConn, _, err := dialer.Dial(backendURL, nil)
-	fmt.Fprintf(os.Stderr, "CONSOLE ERROR: Backend connection failed: %v\n", err)
+	// Connect to backend with proper headers
+	backendConn, resp, err := dialer.Dial(backendURL, backendHeaders)
+
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "CONSOLE ERROR: Backend connection failed: %v\n", err)
 		s.logger.Error("Failed to connect to SIP backend",
 			zap.String("clientID", client.ID),
 			zap.String("backendURL", backendURL),
 			zap.Error(err))
+
+		// Enhanced error logging to help diagnose handshake failures
+		if resp != nil {
+			s.logger.Error("Backend response details",
+				zap.Int("statusCode", resp.StatusCode),
+				zap.String("status", resp.Status),
+				zap.Any("headers", resp.Header))
+		}
 		return // This will close the client connection
 	}
 
