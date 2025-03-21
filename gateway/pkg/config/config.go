@@ -8,7 +8,6 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	// Add these imports
 	"gateway/pkg/ami"
 	"gateway/pkg/common"
 	"gateway/pkg/rtpengine"
@@ -64,7 +63,18 @@ type RTPEngineInstanceConfig struct {
 
 // AsteriskConfig represents Asterisk configuration
 type AsteriskConfig struct {
-	Clients []AsteriskClientConfig `yaml:"clients"`
+	Clients                    []AsteriskClientConfig `yaml:"clients"`
+	DefaultClient              int                    `yaml:"default_client"`
+	HealthCheckIntervalSeconds int                    `yaml:"health_check_interval_seconds"`
+	ConnectionTimeoutSeconds   int                    `yaml:"connection_timeout_seconds"`
+	EnableReconnect            bool                   `yaml:"enable_reconnect"`
+	ReconnectIntervalSeconds   int                    `yaml:"reconnect_interval_seconds"`
+	MaxReconnectAttempts       int                    `yaml:"max_reconnect_attempts"`
+	MaxRetries                 int                    `yaml:"max_retries"`
+	RetryDelay                 string                 `yaml:"retry_delay"`
+	// High availability proxy settings
+	EnableHAProxy     bool     `yaml:"enable_ha_proxy"`
+	OriginalAddresses []string `yaml:"original_addresses"`
 }
 
 // AsteriskClientConfig represents a single Asterisk AMI client configuration
@@ -198,7 +208,6 @@ func LoadConfig(path string) (*Config, error) {
 }
 
 // ToRTPEngineManagerConfig converts the configuration to RTPEngine manager config
-// REPLACE this method with the implementation below
 func (c *Config) ToRTPEngineManagerConfig() rtpengine.ManagerConfig {
 	// Create and return a proper rtpengine.ManagerConfig
 	engines := make([]rtpengine.Config, 0, len(c.RTPEngine.Engines))
@@ -206,8 +215,8 @@ func (c *Config) ToRTPEngineManagerConfig() rtpengine.ManagerConfig {
 		engines = append(engines, rtpengine.Config{
 			Address: eng.Address,
 			Port:    eng.Port,
-
-			Weight: eng.Weight,
+			Timeout: time.Duration(eng.TimeoutMS) * time.Millisecond,
+			Weight:  eng.Weight,
 			CircuitBreaker: common.CircuitBreakerConfig{
 				FailureThreshold: eng.CircuitBreaker.FailureThreshold,
 				ResetTimeout:     time.Duration(eng.CircuitBreaker.ResetSeconds) * time.Second,
@@ -222,16 +231,21 @@ func (c *Config) ToRTPEngineManagerConfig() rtpengine.ManagerConfig {
 }
 
 // ToAsteriskManagerConfig converts the configuration to Asterisk manager config
-// REPLACE this method with the implementation below
 func (c *Config) ToAsteriskManagerConfig() ami.ManagerConfig {
-	// Create and return a proper ami.ManagerConfig
+	// Convert client configs to ami.Config format
 	clients := make([]ami.Config, 0, len(c.Asterisk.Clients))
 	for _, client := range c.Asterisk.Clients {
+		// Convert timeout to duration
+		timeout := time.Duration(client.TimeoutMS) * time.Millisecond
+		if timeout <= 0 {
+			timeout = 5 * time.Second // Default timeout
+		}
+
 		clients = append(clients, ami.Config{
 			Address:  client.Address,
 			Username: client.Username,
 			Secret:   client.Secret,
-
+			Timeout:  timeout,
 			CircuitBreaker: common.CircuitBreakerConfig{
 				FailureThreshold: client.CircuitBreaker.FailureThreshold,
 				ResetTimeout:     time.Duration(client.CircuitBreaker.ResetSeconds) * time.Second,
@@ -241,7 +255,11 @@ func (c *Config) ToAsteriskManagerConfig() ami.ManagerConfig {
 	}
 
 	return ami.ManagerConfig{
-		Clients: clients,
+		Clients:           clients,
+		MaxRetries:        c.Asterisk.MaxRetries,
+		RetryDelay:        c.Asterisk.RetryDelay,
+		EnableHAProxy:     c.Asterisk.EnableHAProxy,
+		OriginalAddresses: c.Asterisk.OriginalAddresses,
 	}
 }
 

@@ -3,13 +3,16 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
@@ -20,6 +23,7 @@ import (
 	"gateway/pkg/common"
 	"gateway/pkg/config"
 	"gateway/pkg/coordinator"
+	"gateway/pkg/health"
 	"gateway/pkg/rtpengine"
 	"gateway/pkg/sip"
 	"gateway/pkg/storage"
@@ -278,7 +282,158 @@ func main() {
 	}
 	fmt.Fprintf(os.Stderr, "DEBUG-39: WebSocket server started successfully\n")
 	logger.Debug("WebSocket server started successfully")
+	fmt.Fprintf(os.Stderr, "DEBUG-39.a: Setting up health monitoring system\n")
+	logger.Info("Setting up health monitoring system")
 
+	// Extract domain from DefaultNextHop
+	opensipsHost := cfg.SIP.DefaultNextHop
+	if idx := strings.LastIndex(opensipsHost, ":"); idx > 0 {
+		opensipsHost = opensipsHost[:idx]
+	}
+
+	healthConfig := health.HealthConfig{
+		OpenSIPSAddress: opensipsHost,                 // Using just the domain part
+		CheckInterval:   15 * time.Second,             // Check every 15 seconds
+		EnableFailover:  cfg.HighAvailability.Enabled, // Use HA config to determine if failover is enabled
+	}
+
+	logger.Debug("Health monitor configuration",
+		zap.String("opensipsAddress", healthConfig.OpenSIPSAddress),
+		zap.Duration("checkInterval", healthConfig.CheckInterval),
+		zap.Bool("enableFailover", healthConfig.EnableFailover))
+
+	healthMonitor := health.NewHealthMonitor(
+		udpTransport, // SIP transport for OpenSIPS checks
+		amiManager,   // AMI manager for Asterisk checks
+		rtpManager,   // RTP manager for RTPEngine checks
+		wsServer,     // WebSocket server for notifications
+		coordinator,  // Coordinator for leadership
+		stateStorage, // Storage for health history
+		logger.Named("health"),
+		healthConfig,
+	)
+
+	// Start health monitoring
+	fmt.Fprintf(os.Stderr, "DEBUG-39.b: Starting health monitoring\n")
+	logger.Info("Starting health monitoring")
+
+	if err := healthMonitor.Start(shutdownCtx); err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: Failed to start health monitoring: %v\n", err)
+		logger.Error("Failed to start health monitoring", zap.Error(err))
+	} else {
+		fmt.Fprintf(os.Stderr, "DEBUG-39.c: Health monitoring started successfully\n")
+		logger.Info("Health monitoring started successfully")
+	}
+
+	// Set up HTTP server for health checks
+	fmt.Fprintf(os.Stderr, "DEBUG-39.d: Setting up HTTP server for health endpoints\n")
+	logger.Info("Setting up HTTP server for health endpoints")
+
+	// Create HTTP server mux
+	httpMux := http.NewServeMux()
+
+	// Register health endpoint
+	httpMux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		logger.Debug("Received health check request",
+			zap.String("remoteAddr", r.RemoteAddr),
+			zap.String("userAgent", r.UserAgent()))
+
+		// Get all component health statuses
+		status := healthMonitor.GetAllComponentHealth()
+
+		// Calculate overall health
+		allHealthy := true
+		for _, comp := range status {
+			if comp.Status != health.StatusHealthy {
+				allHealthy = false
+				logger.Debug("Unhealthy component detected",
+					zap.String("component", comp.Component),
+					zap.String("status", string(comp.Status)),
+					zap.String("message", comp.Message))
+				break
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+
+		// Set appropriate status code
+		if !allHealthy {
+			w.WriteHeader(http.StatusServiceUnavailable) // 503
+			logger.Debug("Returning unhealthy status (503)")
+		} else {
+			logger.Debug("Returning healthy status (200)")
+		}
+
+		// Prepare response
+		statusText := "unhealthy"
+		if allHealthy {
+			statusText = "healthy"
+		}
+		response := map[string]interface{}{
+			"status":     statusText,
+			"components": status,
+			"timestamp":  time.Now(),
+		}
+
+		// Send response
+		if err := json.NewEncoder(w).Encode(response); err != nil {
+			logger.Error("Failed to encode health response", zap.Error(err))
+		}
+	})
+
+	// Add component-specific health endpoints
+	httpMux.HandleFunc("/health/opensips", func(w http.ResponseWriter, r *http.Request) {
+		status := healthMonitor.GetComponentHealth("opensips")
+		w.Header().Set("Content-Type", "application/json")
+
+		if status == nil || status.Status != health.StatusHealthy {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+
+		json.NewEncoder(w).Encode(status)
+	})
+
+	httpMux.HandleFunc("/health/asterisk", func(w http.ResponseWriter, r *http.Request) {
+		status := healthMonitor.GetComponentHealth("asterisk")
+		w.Header().Set("Content-Type", "application/json")
+
+		if status == nil || status.Status != health.StatusHealthy {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+
+		json.NewEncoder(w).Encode(status)
+	})
+
+	httpMux.HandleFunc("/health/rtpengine", func(w http.ResponseWriter, r *http.Request) {
+		status := healthMonitor.GetComponentHealth("rtpengine")
+		w.Header().Set("Content-Type", "application/json")
+
+		if status == nil || status.Status != health.StatusHealthy {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+
+		json.NewEncoder(w).Encode(status)
+	})
+
+	// Create HTTP server
+	httpServer := &http.Server{
+		Addr:    ":8080", // Health check port
+		Handler: httpMux,
+	}
+
+	// Start HTTP server in a goroutine
+	fmt.Fprintf(os.Stderr, "DEBUG-39.e: Starting HTTP server for health endpoints on port 8080\n")
+	logger.Info("Starting HTTP server for health endpoints", zap.String("address", ":8080"))
+
+	go func() {
+		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			fmt.Fprintf(os.Stderr, "ERROR: HTTP server failed: %v\n", err)
+			logger.Error("HTTP server failed", zap.Error(err))
+		}
+	}()
+
+	fmt.Fprintf(os.Stderr, "DEBUG-39.f: HTTP server for health endpoints started\n")
+	logger.Info("HTTP server for health endpoints started")
 	fmt.Fprintf(os.Stderr, "DEBUG-40: All components started successfully\n")
 	logger.Info("WebRTC-SIP Gateway started successfully")
 
@@ -294,36 +449,43 @@ func main() {
 
 	fmt.Fprintf(os.Stderr, "DEBUG-44: Starting component shutdown sequence\n")
 	logger.Info("Shutting down components...")
-
+	fmt.Fprintf(os.Stderr, "DEBUG-45: Shutting down HTTP server\n")
+	httpShutdownCtx, httpCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer httpCancel()
+	if err := httpServer.Shutdown(httpShutdownCtx); err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: Failed to gracefully shut down HTTP server: %v\n", err)
+		logger.Error("Failed to gracefully shut down HTTP server", zap.Error(err))
+	}
+	fmt.Fprintf(os.Stderr, "DEBUG-46: HTTP server shut down\n")
 	// Shutdown components in reverse order
-	fmt.Fprintf(os.Stderr, "DEBUG-45: Stopping WebSocket server\n")
+	fmt.Fprintf(os.Stderr, "DEBUG-47: Stopping WebSocket server\n")
 	if err := wsServer.Stop(); err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: Failed to stop WebSocket server: %v\n", err)
 		logger.Error("Failed to stop WebSocket server", zap.Error(err))
 	}
-	fmt.Fprintf(os.Stderr, "DEBUG-46: WebSocket server stopped\n")
+	fmt.Fprintf(os.Stderr, "DEBUG-48: WebSocket server stopped\n")
 
-	fmt.Fprintf(os.Stderr, "DEBUG-47: Stopping SIP proxy\n")
+	fmt.Fprintf(os.Stderr, "DEBUG-49: Stopping SIP proxy\n")
 	if err := sipProxy.Stop(); err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: Failed to stop SIP proxy: %v\n", err)
 		logger.Error("Failed to stop SIP proxy", zap.Error(err))
 	}
-	fmt.Fprintf(os.Stderr, "DEBUG-48: SIP proxy stopped\n")
+	fmt.Fprintf(os.Stderr, "DEBUG-50: SIP proxy stopped\n")
 
-	fmt.Fprintf(os.Stderr, "DEBUG-49: Shutting down AMI manager\n")
+	fmt.Fprintf(os.Stderr, "DEBUG-51: Shutting down AMI manager\n")
 	amiManager.Shutdown()
-	fmt.Fprintf(os.Stderr, "DEBUG-50: AMI manager shut down\n")
+	fmt.Fprintf(os.Stderr, "DEBUG-52: AMI manager shut down\n")
 
-	fmt.Fprintf(os.Stderr, "DEBUG-51: Closing storage\n")
+	fmt.Fprintf(os.Stderr, "DEBUG-53: Closing storage\n")
 	if err := stateStorage.Close(); err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: Failed to close storage: %v\n", err)
 		logger.Error("Failed to close storage", zap.Error(err))
 	}
-	fmt.Fprintf(os.Stderr, "DEBUG-52: Storage closed\n")
+	fmt.Fprintf(os.Stderr, "DEBUG-54: Storage closed\n")
 
-	fmt.Fprintf(os.Stderr, "DEBUG-53: Shutdown complete\n")
+	fmt.Fprintf(os.Stderr, "DEBUG-55: Shutdown complete\n")
 	logger.Info("Shutdown complete")
-	fmt.Fprintf(os.Stderr, "DEBUG-54: Program exiting\n")
+	fmt.Fprintf(os.Stderr, "DEBUG-56: Program exiting\n")
 }
 
 func setupLogger(level string) *zap.Logger {

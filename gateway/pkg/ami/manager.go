@@ -28,13 +28,25 @@ type Manager struct {
 	maxRetries   int
 	retryDelay   time.Duration
 	initializing int32 // atomic flag to track initialization state
+	proxyServer  *AMIProxyServer
 }
 
 // ManagerConfig holds the configuration for the AMI manager
 type ManagerConfig struct {
-	Clients    []Config `json:"clients"`
-	MaxRetries int      `json:"max_retries"`
-	RetryDelay string   `json:"retry_delay"`
+	Clients           []Config `json:"clients"`
+	MaxRetries        int      `json:"max_retries"`
+	RetryDelay        string   `json:"retry_delay"`
+	EnableHAProxy     bool     `json:"enable_ha_proxy"`
+	OriginalAddresses []string `json:"original_addresses"`
+}
+
+// WrapIsLeader adapts the Coordinator's IsLeader function to match the expected interface
+type IsLeaderAdapter struct {
+	coord *coordinator.Coordinator
+}
+
+func (a *IsLeaderAdapter) IsLeader(component string) bool {
+	return a.coord.IsLeader(component)
 }
 
 // NewManager creates a new AMI manager
@@ -83,7 +95,7 @@ func NewManager(config ManagerConfig, logger *zap.Logger, registry *common.Gorou
 		}
 	}
 
-	return &Manager{
+	manager := &Manager{
 		clients:     clients,
 		logger:      logger,
 		registry:    registry,
@@ -91,7 +103,34 @@ func NewManager(config ManagerConfig, logger *zap.Logger, registry *common.Gorou
 		coordinator: coord,
 		maxRetries:  maxRetries,
 		retryDelay:  retryDelay,
-	}, nil
+	}
+
+	// If high availability proxy is enabled
+	if config.EnableHAProxy && len(config.OriginalAddresses) > 0 {
+		// Create AMI proxy server configuration
+		proxyConfig := ProxyConfig{
+			OriginalAddresses: config.OriginalAddresses,
+			AmiConfigs:        make([]Config, 0, len(config.Clients)),
+		}
+
+		// Convert server configs
+		for _, clientConfig := range config.Clients {
+			proxyConfig.AmiConfigs = append(proxyConfig.AmiConfigs, clientConfig)
+		}
+
+		// Create proxy server
+		proxyServer, err := NewProxyServer(proxyConfig, coord, logger)
+		if err != nil {
+			logger.Warn("Failed to create AMI proxy server", zap.Error(err))
+			// Continue without proxy - this is not fatal
+		} else {
+			manager.proxyServer = proxyServer
+			logger.Info("AMI proxy server created successfully",
+				zap.Strings("addresses", config.OriginalAddresses))
+		}
+	}
+
+	return manager, nil
 }
 
 // Start connects to the primary AMI server and starts health checks
@@ -176,6 +215,16 @@ func (m *Manager) Start(ctx context.Context) error {
 	m.registry.Go("ami-connection-monitor", func(ctx context.Context) {
 		m.monitorConnections(ctx)
 	})
+
+	// Start the AMI proxy server if configured
+	if m.proxyServer != nil {
+		if err := m.proxyServer.Start(); err != nil {
+			m.logger.Error("Failed to start AMI proxy server", zap.Error(err))
+			// Continue anyway - proxy failure shouldn't stop manager
+		} else {
+			m.logger.Info("AMI proxy server started successfully")
+		}
+	}
 
 	return nil
 }

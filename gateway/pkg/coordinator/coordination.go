@@ -150,13 +150,28 @@ func (c *Coordinator) Stop() error {
 	return c.registry.Shutdown(10 * time.Second)
 }
 
-// IsLeader returns whether this instance is the leader
-func (c *Coordinator) IsLeader() bool {
+// IsLeader checks leadership status, optionally for a specific component
+func (c *Coordinator) IsLeader(component ...string) bool {
+	// First check global leadership
 	c.leaderLock.RLock()
-	defer c.leaderLock.RUnlock()
+	isGlobalLeader := c.isLeader && time.Now().Before(c.leaseExpiration)
+	c.leaderLock.RUnlock()
 
-	// Check if leader and lease is still valid
-	return c.isLeader && time.Now().Before(c.leaseExpiration)
+	// If no component is specified, return global leadership status
+	if len(component) == 0 {
+		return isGlobalLeader
+	}
+
+	// If not the global leader, return false (component leadership depends on global leadership)
+	if !isGlobalLeader {
+		return false
+	}
+
+	// Check component-specific leadership
+	c.componentMu.RLock()
+	defer c.componentMu.RUnlock()
+	leader, exists := c.leadership[component[0]]
+	return exists && leader
 }
 
 // RegisterComponentLeadership registers interest in leadership for a component
