@@ -49,7 +49,8 @@ type ServerConfig struct {
 	IdleTimeout          time.Duration
 	EnableIPv4Only       bool
 	ServerName           string
-	DisableSIPProcessing bool
+	DisableSIPProcessing bool        // General flag
+	DisableWSSIPProcessing bool      // Specific to WebSocket SIP processing
 }
 
 // SIPHandler handles SIP messages from WebSocket clients
@@ -103,6 +104,12 @@ func NewServer(config ServerConfig, storage storage.StateStorage, logger *zap.Lo
 		config.ServerName = "WebRTC-SIP-Gateway"
 	}
 
+	logger.Info("Creating WebSocket server with configuration",
+		zap.String("bindAddr", config.BindAddr),
+		zap.String("serverName", config.ServerName),
+		zap.Bool("disableSIPProcessing", config.DisableSIPProcessing),
+		zap.Bool("disableWSSIPProcessing", config.DisableWSSIPProcessing))
+
 	server := &Server{
 		config:      config,
 		storage:     storage,
@@ -142,7 +149,7 @@ func (s *Server) Start(ctx context.Context) error {
 		zap.String("bindAddr", s.config.BindAddr),
 		zap.Bool("tlsEnabled", s.config.CertFile != "" && s.config.KeyFile != ""),
 		zap.String("backendServer", s.config.ServerName),
-	)
+		zap.Bool("disableWSSIPProcessing", s.config.DisableWSSIPProcessing))
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleWebSocket)
@@ -602,7 +609,7 @@ func (s *Server) handleClient(ctx context.Context, client *ClientConnection, sip
 					)
 				}
 
-				// Process the message if SIP
+				// Process the message if SIP - THE CRITICAL FIX IS HERE
 				if msgType == websocket.TextMessage || msgType == websocket.BinaryMessage {
 					sipMsg, err := sip.ParseMessage(msg)
 					if err == nil {
@@ -610,22 +617,32 @@ func (s *Server) handleClient(ctx context.Context, client *ClientConnection, sip
 						if req, ok := sipMsg.(*sip.Request); ok {
 							if req.From() != nil {
 								client.SIPAddress = req.From().Address.String()
-								// --------------------------------------------
-								// Only call handler if NOT disabled
-								// --------------------------------------------
-								if s.handler != nil && !s.config.DisableSIPProcessing {
+								
+								// THIS IS THE FIX: Check DisableWSSIPProcessing specifically for WebSocket SIP processing
+								if s.handler != nil && !s.config.DisableWSSIPProcessing {
 									// create virtual address for the client
 									addr := &websocketAddr{
 										clientID: client.ID,
 										network:  sipTransport,
 										address:  client.RemoteAddr,
 									}
+									
+									s.logger.Debug("Processing SIP message from WebSocket",
+										zap.String("clientID", client.ID),
+										zap.String("method", req.Method.String()),
+										zap.Bool("DisableWSSIPProcessing", s.config.DisableWSSIPProcessing))
+										
 									if err := s.handler.HandleMessage(sipMsg, addr); err != nil {
+										// Log error but don't fail connection
 										s.logger.Error("SIP handler error",
 											zap.String("clientID", client.ID),
 											zap.Error(err),
 										)
 									}
+								} else {
+									s.logger.Debug("Skipping SIP processing (disabled by config)",
+										zap.String("clientID", client.ID),
+										zap.Bool("DisableWSSIPProcessing", s.config.DisableWSSIPProcessing))
 								}
 							}
 						}

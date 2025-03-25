@@ -6,8 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
-	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"os/signal"
@@ -31,41 +29,44 @@ import (
 )
 
 func main() {
-	fmt.Fprintf(os.Stderr, "DEBUG-1: Program starting\n")
+	logger := setupLogger("debug")
+	defer logger.Sync()
 
 	// Parse command-line flags
 	configPath := flag.String("config", "config.yaml", "Path to configuration file")
 	flag.Parse()
-	fmt.Fprintf(os.Stderr, "DEBUG-2: Command line flags parsed, config path: %s\n", *configPath)
+	
+	logger.Info("program starting",
+		zap.String("config_path", *configPath))
 
 	// Load configuration from YAML file
 	cfg, err := config.LoadConfig(*configPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: Failed to load configuration: %v\n", err)
-		log.Fatalf("Failed to load configuration: %v", err)
+		logger.Fatal("failed to load configuration",
+			zap.Error(err))
 	}
-	fmt.Printf("DEBUG: SIP.DisableSIPProcessing = %v\n", cfg.SIP.DisableSIPProcessing)
-	fmt.Fprintf(os.Stderr, "DEBUG-3: Configuration loaded successfully\n")
 
-	// Setup logger
-	logger := setupLogger(cfg.LogLevel)
-	defer logger.Sync()
-	fmt.Fprintf(os.Stderr, "DEBUG-4: Logger setup complete with level: %s\n", cfg.LogLevel)
+	logger.Info("configuration loaded",
+		zap.Bool("sip_processing_disabled", cfg.SIP.DisableSIPProcessing))
 
-	sipCfg := sip.SIPConfig{
-		UDPBindAddr:    cfg.SIP.UDPBindAddr,
-		ProxyURI:       cfg.SIP.ProxyURI,
-		DefaultNextHop: cfg.SIP.DefaultNextHop,
-		MaxForwards:    cfg.SIP.MaxForwards,
-		UserAgent:      cfg.SIP.UserAgent,
-	}
-	fmt.Fprintf(os.Stderr, "DEBUG-5: SIP configuration prepared, UDPBindAddr: %s\n", sipCfg.UDPBindAddr)
-
+		sipCfg := sip.SIPConfig{
+			UDPBindAddr:             cfg.SIP.UDPBindAddr,
+			ProxyURI:                cfg.SIP.ProxyURI,
+			DefaultNextHop:          cfg.SIP.DefaultNextHop,
+			MaxForwards:             cfg.SIP.MaxForwards,
+			UserAgent:               cfg.SIP.UserAgent,
+			DisableUDPSIPProcessing: cfg.SIP.DisableUDPSIPProcessing,
+			DisableWSSIPProcessing:  cfg.SIP.DisableWSSIPProcessing,
+		}
+		logger.Info("SIP configuration prepared",
+		zap.String("UDPBindAddr", sipCfg.UDPBindAddr),
+		zap.String("DefaultNextHop", sipCfg.DefaultNextHop),
+		zap.Bool("DisableUDPSIPProcessing", sipCfg.DisableUDPSIPProcessing),
+		zap.Bool("DisableWSSIPProcessing", sipCfg.DisableWSSIPProcessing))
 	// Create storage
-	fmt.Fprintf(os.Stderr, "DEBUG-6: Creating storage\n")
+	logger.Info("creating storage")
 	var stateStorage storage.StateStorage
 	if cfg.Redis.Enabled {
-		fmt.Fprintf(os.Stderr, "DEBUG-6a: Redis storage would be created here if implemented\n")
 		logger.Info("Redis storage not implemented; using in-memory storage")
 		stateStorage, err = storage.NewMemoryStorage(storage.MemoryConfig{
 			MaxKeys:         cfg.MemoryStorage.MaxKeys,
@@ -73,7 +74,8 @@ func main() {
 			PersistPath:     cfg.MemoryStorage.PersistPath,
 		}, logger)
 	} else {
-		fmt.Fprintf(os.Stderr, "DEBUG-6b: Creating in-memory storage, path: %s\n", cfg.MemoryStorage.PersistPath)
+		logger.Info("creating in-memory storage",
+			zap.String("path", cfg.MemoryStorage.PersistPath))
 		stateStorage, err = storage.NewMemoryStorage(storage.MemoryConfig{
 			MaxKeys:         cfg.MemoryStorage.MaxKeys,
 			CleanupInterval: time.Duration(cfg.MemoryStorage.CleanupIntervalSeconds) * time.Second,
@@ -81,81 +83,74 @@ func main() {
 		}, logger)
 	}
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: Failed to create storage: %v\n", err)
-		logger.Fatal("Failed to create storage", zap.Error(err))
+		logger.Fatal("failed to create storage", zap.Error(err))
 	}
-	fmt.Fprintf(os.Stderr, "DEBUG-7: Storage created successfully\n")
+	logger.Info("storage created successfully")
 
 	// Create a background context for coordinator registration
 	ctx := context.Background()
-	fmt.Fprintf(os.Stderr, "DEBUG-8: Background context created\n")
+	logger.Info("background context created")
 
 	// Create coordinator
-	fmt.Fprintf(os.Stderr, "DEBUG-9: Creating coordinator\n")
+	logger.Info("creating coordinator")
 	coordinator, err := coordinator.NewCoordinator(stateStorage, coordinator.CoordinatorConfig{
 		HeartbeatInterval: cfg.GetHeartbeatInterval(),
 		LeaseTimeout:      cfg.GetLeaseTimeout(),
 	}, logger)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: Failed to create coordinator: %v\n", err)
-		logger.Fatal("Failed to create coordinator", zap.Error(err))
+		logger.Fatal("failed to create coordinator", zap.Error(err))
 	}
-	fmt.Fprintf(os.Stderr, "DEBUG-10: Coordinator created, starting it\n")
+	logger.Info("coordinator created, starting it")
 
 	if err := coordinator.Start(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: Failed to start coordinator: %v\n", err)
-		logger.Fatal("Failed to start coordinator", zap.Error(err))
+		logger.Fatal("failed to start coordinator", zap.Error(err))
 	}
-	fmt.Fprintf(os.Stderr, "DEBUG-11: Coordinator started successfully\n")
+	logger.Info("coordinator started successfully")
 	defer coordinator.Stop()
 
 	// Register components for leadership
-	fmt.Fprintf(os.Stderr, "DEBUG-12: Registering components for leadership\n")
+	logger.Info("registering components for leadership")
 	coordinator.RegisterComponentLeadership("rtpengine")
 	coordinator.RegisterComponentLeadership("ami")
 	coordinator.RegisterComponentLeadership("sip")
 	coordinator.RegisterComponentLeadership("websocket")
-	fmt.Fprintf(os.Stderr, "DEBUG-13: Components registered for leadership\n")
+	logger.Info("components registered for leadership")
 
 	// Create RTPEngine manager
-	fmt.Fprintf(os.Stderr, "DEBUG-14: Creating RTPEngine manager\n")
+	logger.Info("creating RTPEngine manager")
 	rtpManager, err := rtpengine.NewManager(cfg.ToRTPEngineManagerConfig(), logger, common.NewGoroutineRegistry(logger), stateStorage, coordinator)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: Failed to create RTPEngine manager: %v\n", err)
-		logger.Fatal("Failed to create RTPEngine manager", zap.Error(err))
+		logger.Fatal("failed to create RTPEngine manager", zap.Error(err))
 	}
-	fmt.Fprintf(os.Stderr, "DEBUG-15: RTPEngine manager created successfully\n")
+	logger.Info("RTPEngine manager created successfully")
 
 	// Create AMI manager
-	fmt.Fprintf(os.Stderr, "DEBUG-16: Creating AMI manager\n")
+	logger.Info("creating AMI manager")
 	amiManager, err := ami.NewManager(cfg.ToAsteriskManagerConfig(), logger, common.NewGoroutineRegistry(logger), stateStorage, coordinator)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: Failed to create AMI manager: %v\n", err)
-		logger.Fatal("Failed to create AMI manager", zap.Error(err))
+		logger.Fatal("failed to create AMI manager", zap.Error(err))
 	}
-	fmt.Fprintf(os.Stderr, "DEBUG-17: AMI manager created successfully\n")
+	logger.Info("AMI manager created successfully")
 
 	// Create SIP proxy
-	fmt.Fprintf(os.Stderr, "DEBUG-18: Creating SIP proxy\n")
+	logger.Info("creating SIP proxy")
 	sipProxy, err := sip.NewProxy(sipCfg, stateStorage, rtpManager, logger)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: Failed to create SIP proxy: %v\n", err)
-		logger.Fatal("Failed to create SIP proxy", zap.Error(err))
+		logger.Fatal("failed to create SIP proxy", zap.Error(err))
 	}
-	fmt.Fprintf(os.Stderr, "DEBUG-19: SIP proxy created successfully\n")
+	logger.Info("SIP proxy created successfully")
 
 	// Create UDP transport for SIP
-	fmt.Fprintf(os.Stderr, "DEBUG-20: Creating UDP transport at %s\n", cfg.SIP.UDPBindAddr)
+	logger.Info("creating UDP transport at", zap.String("address", cfg.SIP.UDPBindAddr))
 	udpTransport, err := sip.NewUDPTransport(cfg.SIP.UDPBindAddr, logger)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: Failed to create UDP transport: %v\n", err)
-		logger.Fatal("Failed to create UDP transport", zap.Error(err))
+		logger.Fatal("failed to create UDP transport", zap.Error(err))
 	}
 	sipProxy.AddTransport(udpTransport)
-	fmt.Fprintf(os.Stderr, "DEBUG-21: UDP transport created and added to SIP proxy\n")
+	logger.Info("UDP transport created and added to SIP proxy")
 
 	// Convert WebSocket configuration
-	fmt.Fprintf(os.Stderr, "DEBUG-22: Preparing WebSocket configuration\n")
+	logger.Info("preparing WebSocket configuration")
 	wsConfig := websocket.ServerConfig{
 		BindAddr:       cfg.WebSocket.BindAddr,
 		CertFile:       cfg.WebSocket.CertFile,
@@ -167,11 +162,13 @@ func main() {
 		EnableIPv4Only: cfg.WebSocket.EnableIPv4Only,
 		ServerName:     cfg.WebSocket.ServerName,
 	}
-	fmt.Fprintf(os.Stderr, "DEBUG-23: WebSocket config prepared: BindAddr=%s, CertFile=%s, ServerName=%s\n",
-		wsConfig.BindAddr, wsConfig.CertFile, wsConfig.ServerName)
+	logger.Info("WebSocket config prepared",
+		zap.String("bindAddr", wsConfig.BindAddr),
+		zap.String("certFile", wsConfig.CertFile),
+		zap.String("serverName", wsConfig.ServerName))
 
 	// Create WebSocket server
-	fmt.Fprintf(os.Stderr, "DEBUG-24: Creating WebSocket server\n")
+	logger.Info("creating WebSocket server")
 	logger.Debug("Creating WebSocket server with configuration",
 		zap.String("bindAddr", wsConfig.BindAddr),
 		zap.String("certFile", wsConfig.CertFile),
@@ -185,38 +182,36 @@ func main() {
 
 	wsServer, err := websocket.NewServer(wsConfig, stateStorage, logger)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: Failed to create WebSocket server: %v\n", err)
-		logger.Fatal("Failed to create WebSocket server", zap.Error(err))
+		logger.Fatal("failed to create WebSocket server", zap.Error(err))
 	}
-	fmt.Fprintf(os.Stderr, "DEBUG-25: WebSocket server created successfully\n")
+	logger.Info("WebSocket server created successfully")
 
 	logger.Debug("WebSocket server created successfully, setting SIP handler")
-	fmt.Fprintf(os.Stderr, "DEBUG-26: Setting SIP handler for WebSocket server\n")
+	logger.Info("setting SIP handler for WebSocket server")
 	wsServer.SetSIPHandler(sipProxy)
-	fmt.Fprintf(os.Stderr, "DEBUG-27: SIP handler set for WebSocket server\n")
+	logger.Info("SIP handler set for WebSocket server")
 
 	// Create a context for coordinated shutdown
-	fmt.Fprintf(os.Stderr, "DEBUG-28: Creating shutdown context\n")
+	logger.Info("creating shutdown context")
 	shutdownCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	fmt.Fprintf(os.Stderr, "DEBUG-29: Shutdown context created\n")
+	logger.Info("shutdown context created")
 
 	// Start components
-	fmt.Fprintf(os.Stderr, "DEBUG-30: Starting WebRTC-SIP Gateway components\n")
+	logger.Info("starting WebRTC-SIP Gateway components")
 	logger.Info("Starting WebRTC-SIP Gateway...")
 
-	fmt.Fprintf(os.Stderr, "DEBUG-31: Starting RTPEngine manager\n")
+	logger.Info("starting RTPEngine manager")
 	rtpManager.Start(shutdownCtx)
-	fmt.Fprintf(os.Stderr, "DEBUG-32: RTPEngine manager started\n")
+	logger.Info("RTPEngine manager started")
 
-	fmt.Fprintf(os.Stderr, "DEBUG-33: Starting AMI manager\n")
+	logger.Info("starting AMI manager")
 	if err := amiManager.Start(shutdownCtx); err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: Failed to start AMI manager: %v\n", err)
-		logger.Fatal("Failed to start AMI manager", zap.Error(err))
+		logger.Fatal("failed to start AMI manager", zap.Error(err))
 	}
-	fmt.Fprintf(os.Stderr, "DEBUG-34: AMI manager started successfully\n")
+	logger.Info("AMI manager started successfully")
 
-	fmt.Fprintf(os.Stderr, "DEBUG-35: Starting SIP proxy\n")
+	logger.Info("starting SIP proxy")
 
 	// Create a channel to receive initialization status
 	sipReadyChan := make(chan error, 1)
@@ -244,46 +239,42 @@ func main() {
 	select {
 	case err := <-sipReadyChan:
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "ERROR: Failed to start SIP proxy: %v\n", err)
-			logger.Error("Failed to start SIP proxy", zap.Error(err))
+			logger.Error("failed to start SIP proxy", zap.Error(err))
 			// Continue anyway instead of calling logger.Fatal which would terminate
 		} else {
-			fmt.Fprintf(os.Stderr, "DEBUG-36: SIP proxy started successfully\n")
+			logger.Info("SIP proxy started successfully")
 		}
 	case <-time.After(2 * time.Second):
 		// No immediate error, assume success and continue
-		fmt.Fprintf(os.Stderr, "DEBUG-36: SIP proxy initialization in progress, continuing startup\n")
+		logger.Info("SIP proxy initialization in progress, continuing startup")
 		logger.Info("SIP proxy initialization in progress, continuing startup")
 	}
 
 	// Continue with the rest of the startup sequence
-	fmt.Fprintf(os.Stderr, "DEBUG-37: About to start WebSocket server\n")
+	logger.Info("about to start WebSocket server")
 
 	// Add panic recovery to catch any silent failures
 	defer func() {
 		if r := recover(); r != nil {
-			fmt.Fprintf(os.Stderr, "PANIC RECOVERED during WebSocket start: %v\n", r)
+			logger.Error("PANIC RECOVERED during WebSocket start", zap.Any("panic", r))
 			// Stack trace
 			buf := make([]byte, 4096)
 			n := runtime.Stack(buf, false)
-			fmt.Fprintf(os.Stderr, "Stack trace: %s\n", buf[:n])
+			logger.Error("Stack trace", zap.String("trace", string(buf[:n])))
 		}
 	}()
 
 	logger.Debug("Preparing to start WebSocket server...")
-	fmt.Fprintf(os.Stderr, "DEBUG-38: Starting WebSocket server on %s\n", wsConfig.BindAddr)
+	logger.Info("starting WebSocket server on", zap.String("bindAddr", wsConfig.BindAddr))
 	if err := wsServer.Start(shutdownCtx); err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: WebSocket server start failed: %v\n", err)
 		logger.Error("WebSocket server start failed with error",
 			zap.Error(err),
 			zap.String("bindAddr", wsConfig.BindAddr),
 			zap.String("certFile", wsConfig.CertFile))
-		logger.Fatal("Failed to start WebSocket server", zap.Error(err))
+		logger.Fatal("failed to start WebSocket server", zap.Error(err))
 	}
-	fmt.Fprintf(os.Stderr, "DEBUG-39: WebSocket server started successfully\n")
-	logger.Debug("WebSocket server started successfully")
-	fmt.Fprintf(os.Stderr, "DEBUG-39.a: Setting up health monitoring system\n")
-	logger.Info("Setting up health monitoring system")
+	logger.Info("WebSocket server started successfully")
+	logger.Info("setting up health monitoring system")
 
 	// Extract domain from DefaultNextHop
 	opensipsHost := cfg.SIP.DefaultNextHop
@@ -314,20 +305,16 @@ func main() {
 	)
 
 	// Start health monitoring
-	fmt.Fprintf(os.Stderr, "DEBUG-39.b: Starting health monitoring\n")
-	logger.Info("Starting health monitoring")
+	logger.Info("starting health monitoring")
 
 	if err := healthMonitor.Start(shutdownCtx); err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: Failed to start health monitoring: %v\n", err)
-		logger.Error("Failed to start health monitoring", zap.Error(err))
+		logger.Error("failed to start health monitoring", zap.Error(err))
 	} else {
-		fmt.Fprintf(os.Stderr, "DEBUG-39.c: Health monitoring started successfully\n")
-		logger.Info("Health monitoring started successfully")
+		logger.Info("health monitoring started successfully")
 	}
 
 	// Set up HTTP server for health checks
-	fmt.Fprintf(os.Stderr, "DEBUG-39.d: Setting up HTTP server for health endpoints\n")
-	logger.Info("Setting up HTTP server for health endpoints")
+	logger.Info("setting up HTTP server for health endpoints")
 
 	// Create HTTP server mux
 	httpMux := http.NewServeMux()
@@ -377,7 +364,7 @@ func main() {
 
 		// Send response
 		if err := json.NewEncoder(w).Encode(response); err != nil {
-			logger.Error("Failed to encode health response", zap.Error(err))
+			logger.Error("failed to encode health response", zap.Error(err))
 		}
 	})
 
@@ -422,70 +409,61 @@ func main() {
 	}
 
 	// Start HTTP server in a goroutine
-	fmt.Fprintf(os.Stderr, "DEBUG-39.e: Starting HTTP server for health endpoints on port 8080\n")
-	logger.Info("Starting HTTP server for health endpoints", zap.String("address", ":8080"))
+	logger.Info("starting HTTP server for health endpoints", zap.String("address", ":8080"))
 
 	go func() {
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			fmt.Fprintf(os.Stderr, "ERROR: HTTP server failed: %v\n", err)
 			logger.Error("HTTP server failed", zap.Error(err))
 		}
 	}()
 
-	fmt.Fprintf(os.Stderr, "DEBUG-39.f: HTTP server for health endpoints started\n")
 	logger.Info("HTTP server for health endpoints started")
-	fmt.Fprintf(os.Stderr, "DEBUG-40: All components started successfully\n")
 	logger.Info("WebRTC-SIP Gateway started successfully")
 
 	// Handle signals for graceful shutdown
-	fmt.Fprintf(os.Stderr, "DEBUG-41: Setting up signal handler for graceful shutdown\n")
+	logger.Info("setting up signal handler for graceful shutdown")
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	fmt.Fprintf(os.Stderr, "DEBUG-42: Waiting for shutdown signal\n")
+	logger.Info("waiting for shutdown signal")
 	sig := <-sigCh
-	fmt.Fprintf(os.Stderr, "DEBUG-43: Shutdown signal received: %s\n", sig.String())
-	logger.Info("Shutdown signal received", zap.String("signal", sig.String()))
+	logger.Info("shutdown signal received", zap.String("signal", sig.String()))
 	cancel()
 
-	fmt.Fprintf(os.Stderr, "DEBUG-44: Starting component shutdown sequence\n")
+	logger.Info("starting component shutdown sequence")
 	logger.Info("Shutting down components...")
-	fmt.Fprintf(os.Stderr, "DEBUG-45: Shutting down HTTP server\n")
+	logger.Info("shutting down HTTP server")
 	httpShutdownCtx, httpCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer httpCancel()
 	if err := httpServer.Shutdown(httpShutdownCtx); err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: Failed to gracefully shut down HTTP server: %v\n", err)
-		logger.Error("Failed to gracefully shut down HTTP server", zap.Error(err))
+		logger.Error("failed to gracefully shut down HTTP server", zap.Error(err))
 	}
-	fmt.Fprintf(os.Stderr, "DEBUG-46: HTTP server shut down\n")
+	logger.Info("HTTP server shut down")
 	// Shutdown components in reverse order
-	fmt.Fprintf(os.Stderr, "DEBUG-47: Stopping WebSocket server\n")
+	logger.Info("stopping WebSocket server")
 	if err := wsServer.Stop(); err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: Failed to stop WebSocket server: %v\n", err)
-		logger.Error("Failed to stop WebSocket server", zap.Error(err))
+		logger.Error("failed to stop WebSocket server", zap.Error(err))
 	}
-	fmt.Fprintf(os.Stderr, "DEBUG-48: WebSocket server stopped\n")
+	logger.Info("WebSocket server stopped")
 
-	fmt.Fprintf(os.Stderr, "DEBUG-49: Stopping SIP proxy\n")
+	logger.Info("stopping SIP proxy")
 	if err := sipProxy.Stop(); err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: Failed to stop SIP proxy: %v\n", err)
-		logger.Error("Failed to stop SIP proxy", zap.Error(err))
+		logger.Error("failed to stop SIP proxy", zap.Error(err))
 	}
-	fmt.Fprintf(os.Stderr, "DEBUG-50: SIP proxy stopped\n")
+	logger.Info("SIP proxy stopped")
 
-	fmt.Fprintf(os.Stderr, "DEBUG-51: Shutting down AMI manager\n")
+	logger.Info("shutting down AMI manager")
 	amiManager.Shutdown()
-	fmt.Fprintf(os.Stderr, "DEBUG-52: AMI manager shut down\n")
+	logger.Info("AMI manager shut down")
 
-	fmt.Fprintf(os.Stderr, "DEBUG-53: Closing storage\n")
+	logger.Info("closing storage")
 	if err := stateStorage.Close(); err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: Failed to close storage: %v\n", err)
-		logger.Error("Failed to close storage", zap.Error(err))
+		logger.Error("failed to close storage", zap.Error(err))
 	}
-	fmt.Fprintf(os.Stderr, "DEBUG-54: Storage closed\n")
+	logger.Info("storage closed")
 
-	fmt.Fprintf(os.Stderr, "DEBUG-55: Shutdown complete\n")
-	logger.Info("Shutdown complete")
-	fmt.Fprintf(os.Stderr, "DEBUG-56: Program exiting\n")
+	logger.Info("shutdown complete")
+	logger.Info("WebRTC-SIP Gateway started successfully")
+	logger.Info("program exiting")
 }
 
 func setupLogger(level string) *zap.Logger {
@@ -503,26 +481,46 @@ func setupLogger(level string) *zap.Logger {
 		logLevel = zapcore.InfoLevel
 	}
 
-	config := zap.Config{
-		Level:            zap.NewAtomicLevelAt(logLevel),
-		Encoding:         "json",
-		OutputPaths:      []string{"stdout"},
-		ErrorOutputPaths: []string{"stderr"},
-		EncoderConfig: zapcore.EncoderConfig{
-			MessageKey:     "message",
-			LevelKey:       "level",
-			TimeKey:        "time",
-			NameKey:        "logger",
-			CallerKey:      "caller",
-			FunctionKey:    zapcore.OmitKey,
-			StacktraceKey:  "stacktrace",
-			LineEnding:     zapcore.DefaultLineEnding,
-			EncodeLevel:    zapcore.LowercaseLevelEncoder,
-			EncodeTime:     zapcore.ISO8601TimeEncoder,
-			EncodeDuration: zapcore.StringDurationEncoder,
-			EncodeCaller:   zapcore.ShortCallerEncoder,
-		},
+	// Create custom console encoder config
+	encoderConfig := zapcore.EncoderConfig{
+		TimeKey:        "time",
+		LevelKey:       "level",
+		NameKey:        "logger",
+		CallerKey:      "caller",
+		FunctionKey:    zapcore.OmitKey,
+		MessageKey:     "message",
+		StacktraceKey:  "stacktrace",
+		LineEnding:     zapcore.DefaultLineEnding,
+		EncodeLevel:    zapcore.LowercaseColorLevelEncoder,
+		EncodeTime:     zapcore.ISO8601TimeEncoder,
+		EncodeDuration: zapcore.StringDurationEncoder,
+		EncodeCaller:   zapcore.ShortCallerEncoder,
 	}
-	logger, _ := config.Build()
+
+	// Create console core for prettier development output
+	consoleCore := zapcore.NewCore(
+		zapcore.NewConsoleEncoder(encoderConfig),
+		zapcore.AddSync(os.Stdout),
+		logLevel,
+	)
+
+	// Create JSON core for structured logging
+	jsonConfig := encoderConfig
+	jsonConfig.EncodeLevel = zapcore.LowercaseLevelEncoder
+	jsonCore := zapcore.NewCore(
+		zapcore.NewJSONEncoder(jsonConfig),
+		zapcore.AddSync(os.Stderr),
+		logLevel,
+	)
+
+	// Combine both cores
+	core := zapcore.NewTee(consoleCore, jsonCore)
+
+	// Create logger
+	logger := zap.New(core,
+		zap.AddCaller(),
+		zap.AddStacktrace(zapcore.ErrorLevel),
+	)
+
 	return logger
 }
