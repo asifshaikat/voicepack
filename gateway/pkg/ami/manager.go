@@ -83,7 +83,7 @@ func NewManager(config ManagerConfig, logger *zap.Logger, registry *common.Gorou
 	}
 
 	// Set default values for retry parameters
-	maxRetries := 5
+	maxRetries := 3
 	if config.MaxRetries > 0 {
 		maxRetries = config.MaxRetries
 	}

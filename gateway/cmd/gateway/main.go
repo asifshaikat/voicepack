@@ -29,7 +29,7 @@ import (
 )
 
 func main() {
-	logger := setupLogger("debug")
+	logger := setupLogger("info")
 	defer logger.Sync()
 
 	// Parse command-line flags
@@ -150,18 +150,23 @@ func main() {
 	logger.Info("UDP transport created and added to SIP proxy")
 
 	// Convert WebSocket configuration
-	logger.Info("preparing WebSocket configuration")
-	wsConfig := websocket.ServerConfig{
-		BindAddr:       cfg.WebSocket.BindAddr,
-		CertFile:       cfg.WebSocket.CertFile,
-		KeyFile:        cfg.WebSocket.KeyFile,
-		MaxConnections: cfg.WebSocket.MaxConnections,
-		ReadTimeout:    cfg.GetWebSocketReadTimeout(),
-		WriteTimeout:   cfg.GetWebSocketWriteTimeout(),
-		IdleTimeout:    cfg.GetWebSocketIdleTimeout(),
-		EnableIPv4Only: cfg.WebSocket.EnableIPv4Only,
-		ServerName:     cfg.WebSocket.ServerName,
-	}
+// Convert WebSocket configuration
+logger.Info("preparing WebSocket configuration")
+wsConfig := websocket.ServerConfig{
+    BindAddr:             cfg.WebSocket.BindAddr,
+    CertFile:             cfg.WebSocket.CertFile,
+    KeyFile:              cfg.WebSocket.KeyFile,
+    MaxConnections:       cfg.WebSocket.MaxConnections,
+    ReadTimeout:          cfg.GetWebSocketReadTimeout(),
+    WriteTimeout:         cfg.GetWebSocketWriteTimeout(),
+    IdleTimeout:          cfg.GetWebSocketIdleTimeout(),
+    EnableIPv4Only:       cfg.WebSocket.EnableIPv4Only,
+    ServerName:           cfg.WebSocket.ServerName,
+    BackendServers:       cfg.WebSocket.BackendServers,     // New field
+    FailoverThreshold:    cfg.WebSocket.FailoverThreshold,  // New field
+    DisableSIPProcessing: cfg.WebSocket.DisableSIPProcessing,
+    DisableWSSIPProcessing: cfg.WebSocket.DisableWSSIPProcessing,
+}
 	logger.Info("WebSocket config prepared",
 		zap.String("bindAddr", wsConfig.BindAddr),
 		zap.String("certFile", wsConfig.CertFile),

@@ -157,7 +157,39 @@ func (h *HealthMonitor) monitorLoop(ctx context.Context) {
 		}
 	}
 }
-
+// In your health monitoring system
+func (h *HealthMonitor) checkWebSocketBackends(ctx context.Context) {
+    if h.wsServer == nil {
+        return
+    }
+    
+    // Trigger WebSocket backend health checks
+    h.wsServer.CheckBackendHealth(ctx)
+    
+    // Get status from recent checks
+    h.mutex.Lock()
+    defer h.mutex.Unlock()
+    
+    if _, exists := h.componentStatus["websocket_backends"]; !exists {
+        h.componentStatus["websocket_backends"] = &ComponentHealth{
+            Component: "websocket_backends",
+            Status:    StatusUnhealthy,
+        }
+    }
+    
+    // Update component status based on WebSocket backend health
+    status := h.componentStatus["websocket_backends"]
+    status.LastChecked = time.Now()
+    
+    // This assumes you'll add a method to the WebSocket server to report overall health
+    if h.wsServer.HasHealthyBackends() {
+        status.Status = StatusHealthy
+        status.Message = "At least one WebSocket backend is healthy"
+    } else {
+        status.Status = StatusUnhealthy
+        status.Message = "No healthy WebSocket backends available"
+    }
+}
 // checkAllComponents performs health checks for all components
 func (h *HealthMonitor) checkAllComponents(ctx context.Context) {
 	h.checkOpenSIPS(ctx)

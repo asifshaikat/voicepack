@@ -99,18 +99,22 @@ type SIPConfig struct {
 }
 
 // WebSocketConfig represents WebSocket server configuration
+// WebSocketConfig represents WebSocket server configuration
 type WebSocketConfig struct {
-	BindAddr                string `yaml:"bind_addr"`
-	CertFile                string `yaml:"cert_file"`
-	KeyFile                 string `yaml:"key_file"`
-	MaxConnections          int    `yaml:"max_connections"`
-	ReadTimeoutMS           int    `yaml:"read_timeout_ms"`
-	WriteTimeoutMS          int    `yaml:"write_timeout_ms"`
-	IdleTimeoutMS           int    `yaml:"idle_timeout_ms"`
-	EnableIPv4Only          bool   `yaml:"enable_ipv4_only"`
-	ServerName              string `yaml:"server_name"`
-	DisableUDPSIPProcessing bool   `yaml:"disable_udp_sip_processing"`
-	DisableWSSIPProcessing  bool   `yaml:"disable_ws_sip_processing"`
+	BindAddr                string   `yaml:"bind_addr"`
+	CertFile                string   `yaml:"cert_file"`
+	KeyFile                 string   `yaml:"key_file"`
+	MaxConnections          int      `yaml:"max_connections"`
+	ReadTimeoutMS           int      `yaml:"read_timeout_ms"`
+	WriteTimeoutMS          int      `yaml:"write_timeout_ms"`
+	IdleTimeoutMS           int      `yaml:"idle_timeout_ms"`
+	EnableIPv4Only          bool     `yaml:"enable_ipv4_only"`
+	ServerName              string   `yaml:"server_name"`
+	BackendServers          []string `yaml:"backend_servers"`    // New field
+	FailoverThreshold       int      `yaml:"failover_threshold"` // New field
+	DisableUDPSIPProcessing bool     `yaml:"disable_udp_sip_processing"`
+	DisableSIPProcessing    bool     `yaml:"disable_sip_processing"`
+	DisableWSSIPProcessing  bool     `yaml:"disable_ws_sip_processing"`
 }
 
 // MetricsConfig represents Prometheus metrics configuration
