@@ -15,16 +15,43 @@ import (
 
 // Config represents the main configuration for the gateway
 type Config struct {
-	LogLevel            string          `yaml:"log_level"`
-	ShutdownWaitSeconds int             `yaml:"shutdown_wait_seconds"`
-	Redis               RedisConfig     `yaml:"redis"`
-	MemoryStorage       MemoryConfig    `yaml:"memory_storage"`
-	RTPEngine           RTPEngineConfig `yaml:"rtpengine"`
-	Asterisk            AsteriskConfig  `yaml:"asterisk"`
-	SIP                 SIPConfig       `yaml:"sip"`
-	WebSocket           WebSocketConfig `yaml:"websocket"`
-	Metrics             MetricsConfig   `yaml:"metrics"`
-	HighAvailability    HAConfig        `yaml:"high_availability"`
+	LogLevel            string            `yaml:"log_level"`
+	Logging             LogConfig         `yaml:"logging"`
+	ShutdownWaitSeconds int               `yaml:"shutdown_wait_seconds"`
+	Redis               RedisConfig       `yaml:"redis"`
+	MemoryStorage       MemoryConfig      `yaml:"memory_storage"`
+	RTPEngine           RTPEngineConfig   `yaml:"rtpengine"`
+	Asterisk            AsteriskConfig    `yaml:"asterisk"`
+	SIP                 SIPConfig         `yaml:"sip"`
+	WebSocket           WebSocketConfig   `yaml:"websocket"`
+	Metrics             MetricsConfig     `yaml:"metrics"`
+	HighAvailability    HAConfig          `yaml:"high_availability"`
+	TestingMode         ServiceTestConfig `yaml:"testing_mode"`
+}
+
+// ServiceTestConfig allows enabling/disabling specific services for testing
+type ServiceTestConfig struct {
+	Enabled              bool `yaml:"enabled"`                   // Master switch for testing mode
+	EnableWebSocket      bool `yaml:"enable_websocket"`          // Enable WebSocket service
+	EnableSIP            bool `yaml:"enable_sip"`                // Enable SIP service
+	EnableRTP            bool `yaml:"enable_rtp"`                // Enable RTPEngine service
+	EnableAMI            bool `yaml:"enable_ami"`                // Enable Asterisk AMI service
+	VerboseLogging       bool `yaml:"verbose_logging"`           // Enable more detailed logging for tests
+	LogSIPMessages       bool `yaml:"log_sip_messages"`          // Log full SIP message content
+	SimulateBackendDelay int  `yaml:"simulate_backend_delay_ms"` // Add artificial delay (ms) to backend responses
+}
+
+// LogConfig represents logging configuration
+type LogConfig struct {
+	UseConsole      bool   `yaml:"use_console"`       // Output to console
+	UseJSON         bool   `yaml:"use_json"`          // Use JSON formatting
+	LogFile         string `yaml:"log_file"`          // Path to log file
+	Directory       string `yaml:"directory"`         // Directory for logs
+	MaxSize         int    `yaml:"max_size_mb"`       // Maximum size in MB before rotation
+	MaxBackups      int    `yaml:"max_backups"`       // Maximum number of backups to keep
+	MaxAge          int    `yaml:"max_age_days"`      // Maximum age of log files in days
+	Compress        bool   `yaml:"compress"`          // Compress rotated logs
+	IncludeDateTime bool   `yaml:"include_date_time"` // Include date/time in filename
 }
 
 // RedisConfig represents Redis configuration
@@ -88,14 +115,15 @@ type AsteriskClientConfig struct {
 
 // SIPConfig represents SIP proxy configuration
 type SIPConfig struct {
-	UDPBindAddr             string `yaml:"udp_bind_addr"`
-	ProxyURI                string `yaml:"proxy_uri"`
-	DefaultNextHop          string `yaml:"default_next_hop"`
-	MaxForwards             int    `yaml:"max_forwards"`
-	UserAgent               string `yaml:"user_agent"`
-	DisableSIPProcessing    bool   `yaml:"disable_sip_processing"`
-	DisableUDPSIPProcessing bool   `yaml:"disable_udp_sip_processing"`
-	DisableWSSIPProcessing  bool   `yaml:"disable_ws_sip_processing"`
+	UDPBindAddr             string   `yaml:"udp_bind_addr"`
+	ProxyURI                string   `yaml:"proxy_uri"`
+	DefaultNextHop          string   `yaml:"default_next_hop"`
+	MaxForwards             int      `yaml:"max_forwards"`
+	UserAgent               string   `yaml:"user_agent"`
+	DisableSIPProcessing    bool     `yaml:"disable_sip_processing"`
+	DisableUDPSIPProcessing bool     `yaml:"disable_udp_sip_processing"`
+	DisableWSSIPProcessing  bool     `yaml:"disable_ws_sip_processing"`
+	Backends                []string `yaml:"backends"`
 }
 
 // WebSocketConfig represents WebSocket server configuration
@@ -115,6 +143,9 @@ type WebSocketConfig struct {
 	DisableUDPSIPProcessing bool     `yaml:"disable_udp_sip_processing"`
 	DisableSIPProcessing    bool     `yaml:"disable_sip_processing"`
 	DisableWSSIPProcessing  bool     `yaml:"disable_ws_sip_processing"`
+	DomainRewriteEnabled    bool     `yaml:"domain_rewrite_enabled"`
+	SIPHeaderRewriting      bool     `yaml:"sip_header_rewriting"`
+	LogSIPTransformations   bool     `yaml:"log_sip_transformations"`
 }
 
 // MetricsConfig represents Prometheus metrics configuration
@@ -157,6 +188,28 @@ func LoadConfig(path string) (*Config, error) {
 
 	if config.ShutdownWaitSeconds <= 0 {
 		config.ShutdownWaitSeconds = 30
+	}
+
+	// Logging defaults
+	if config.Logging.Directory == "" {
+		config.Logging.Directory = "/var/logs/voiceproxy"
+	}
+
+	if config.Logging.MaxSize <= 0 {
+		config.Logging.MaxSize = 100 // 100 MB
+	}
+
+	if config.Logging.MaxBackups <= 0 {
+		config.Logging.MaxBackups = 10
+	}
+
+	if config.Logging.MaxAge <= 0 {
+		config.Logging.MaxAge = 30 // 30 days
+	}
+
+	// Default to console output if not specified
+	if !config.Logging.UseConsole && config.Logging.LogFile == "" {
+		config.Logging.UseConsole = true
 	}
 
 	// Memory storage defaults
@@ -204,11 +257,25 @@ func LoadConfig(path string) (*Config, error) {
 
 	// HA defaults
 	if config.HighAvailability.HeartbeatInterval <= 0 {
-		config.HighAvailability.HeartbeatInterval = 5000 // 5 seconds
+		config.HighAvailability.HeartbeatInterval = 2000 // 2 seconds (from 5s)
 	}
 
 	if config.HighAvailability.LeaseTimeout <= 0 {
-		config.HighAvailability.LeaseTimeout = 15000 // 15 seconds
+		config.HighAvailability.LeaseTimeout = 7000 // 7 seconds (from 15s)
+	}
+
+	// Testing mode defaults
+	if config.TestingMode.Enabled {
+		// If testing mode is enabled but no services are specified, enable them all
+		if !config.TestingMode.EnableWebSocket &&
+			!config.TestingMode.EnableSIP &&
+			!config.TestingMode.EnableRTP &&
+			!config.TestingMode.EnableAMI {
+			config.TestingMode.EnableWebSocket = true
+			config.TestingMode.EnableSIP = true
+			config.TestingMode.EnableRTP = true
+			config.TestingMode.EnableAMI = true
+		}
 	}
 
 	return &config, nil
@@ -264,10 +331,20 @@ func (c *Config) ToAsteriskManagerConfig() ami.ManagerConfig {
 	return ami.ManagerConfig{
 		Clients:           clients,
 		MaxRetries:        c.Asterisk.MaxRetries,
-		RetryDelay:        c.Asterisk.RetryDelay,
+		RetryDelay:        c.GetAsteriskRetryDelay(),
 		EnableHAProxy:     c.Asterisk.EnableHAProxy,
 		OriginalAddresses: c.Asterisk.OriginalAddresses,
 	}
+}
+
+// GetAsteriskRetryDelay returns the AMI retry delay as a duration
+func (c *Config) GetAsteriskRetryDelay() time.Duration {
+	retryDelay, err := time.ParseDuration(c.Asterisk.RetryDelay)
+	if err != nil {
+		// Default to 5 seconds if parsing fails
+		return 5 * time.Second
+	}
+	return retryDelay
 }
 
 // GetWebSocketReadTimeout returns the WebSocket read timeout as a duration

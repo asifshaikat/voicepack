@@ -206,14 +206,20 @@ func newCancelRequest(inviteRequest *sip.Request) *sip.Request {
 	return cancelReq
 }
 
+// SIPConfig represents configuration for the SIP proxy
 type SIPConfig struct {
 	UDPBindAddr             string
 	ProxyURI                string
 	DefaultNextHop          string
 	MaxForwards             int
 	UserAgent               string
+	DisableSIPProcessing    bool
 	DisableUDPSIPProcessing bool
 	DisableWSSIPProcessing  bool
+
+	// Testing mode fields
+	Disabled        bool // Whether this component is disabled in testing mode
+	LogFullMessages bool // Whether to log full SIP messages for debugging
 }
 
 type Proxy struct {
@@ -451,11 +457,10 @@ func (p *Proxy) handleBye(req *Request, clientAddr string) error {
 		zap.Bool("skipProcessing", skipProcessing),
 	)
 
-	if skipProcessing {
-		p.logger.Debug("Skipping processing for BYE request",
-			zap.String("clientAddr", clientAddr))
-		return nil
-	}
+	// IMPORTANT: Always forward BYE requests even if processing is disabled
+	// This ensures call termination works correctly
+	p.logger.Debug("Forwarding BYE request regardless of processing flag",
+		zap.String("clientAddr", clientAddr))
 
 	return p.forwardRequest(req, clientAddr)
 }
@@ -503,11 +508,10 @@ func (p *Proxy) handleCancel(req *Request, clientAddr string) error {
 		zap.Bool("skipProcessing", skipProcessing),
 	)
 
-	if skipProcessing {
-		p.logger.Debug("Skipping processing for CANCEL request",
-			zap.String("clientAddr", clientAddr))
-		return nil
-	}
+	// IMPORTANT: Always forward CANCEL requests even if processing is disabled
+	// This ensures call termination works correctly
+	p.logger.Debug("Forwarding CANCEL request regardless of processing flag",
+		zap.String("clientAddr", clientAddr))
 
 	return p.forwardRequest(req, clientAddr)
 }
@@ -529,11 +533,9 @@ func (p *Proxy) handleOptions(req *Request, clientAddr string) error {
 		zap.Bool("skipProcessing", skipProcessing),
 	)
 
-	if skipProcessing {
-		p.logger.Debug("Skipping processing for OPTIONS request",
-			zap.String("clientAddr", clientAddr))
-		return nil
-	}
+	// Always forward OPTIONS requests to maintain session health
+	p.logger.Debug("Forwarding OPTIONS request for session maintenance",
+		zap.String("clientAddr", clientAddr))
 
 	return p.forwardRequest(req, clientAddr)
 }

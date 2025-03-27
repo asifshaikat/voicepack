@@ -1131,3 +1131,8 @@ func (c *AMIClient) Hangup(channel, cause string) (map[string]string, error) {
 
 	return c.SendAction(action)
 }
+
+// GetAddress returns the client's address
+func (c *AMIClient) GetAddress() string {
+	return c.address
+}

@@ -8,6 +8,7 @@ require (
 	github.com/prometheus/client_golang v1.21.1
 	github.com/zeebo/bencode v1.0.0
 	go.uber.org/zap v1.27.0
+	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 	gopkg.in/yaml.v3 v3.0.1
 )
 

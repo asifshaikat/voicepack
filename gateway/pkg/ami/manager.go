@@ -2,6 +2,7 @@ package ami
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -16,6 +17,27 @@ import (
 	"gateway/pkg/storage"
 )
 
+// Add the ClientStatus type near the start of the file
+// ClientStatus tracks health status of an AMI client
+type ClientStatus struct {
+	IsHealthy  bool
+	FailCount  int
+	LastFailed time.Time
+}
+
+// AMIAction represents an action to be sent to AMI
+type AMIAction struct {
+	ActionID   string
+	Command    string
+	Params     map[string]string
+	Timestamp  time.Time
+	ExpireTime time.Time
+	Retries    int
+}
+
+// Response represents the response from an AMI action
+type Response map[string]string
+
 // Manager handles multiple AMI clients with failover
 type Manager struct {
 	clients      []*AMIClient
@@ -29,15 +51,25 @@ type Manager struct {
 	retryDelay   time.Duration
 	initializing int32 // atomic flag to track initialization state
 	proxyServer  *AMIProxyServer
+	clientStatus []ClientStatus
 }
 
-// ManagerConfig holds the configuration for the AMI manager
+// ManagerConfig defines configuration for the AMI manager
 type ManagerConfig struct {
-	Clients           []Config `json:"clients"`
-	MaxRetries        int      `json:"max_retries"`
-	RetryDelay        string   `json:"retry_delay"`
-	EnableHAProxy     bool     `json:"enable_ha_proxy"`
-	OriginalAddresses []string `json:"original_addresses"`
+	Clients              []Config
+	DefaultClient        int
+	HealthCheckInterval  time.Duration
+	ConnectionTimeout    time.Duration
+	EnableReconnect      bool
+	ReconnectInterval    time.Duration
+	MaxReconnectAttempts int
+	MaxRetries           int
+	RetryDelay           time.Duration
+	EnableHAProxy        bool     // Enable high availability proxy mode
+	OriginalAddresses    []string // Original AMI server addresses for HA mode
+
+	// Testing mode fields
+	Disabled bool // Whether this component is disabled in testing mode
 }
 
 // WrapIsLeader adapts the Coordinator's IsLeader function to match the expected interface
@@ -89,10 +121,8 @@ func NewManager(config ManagerConfig, logger *zap.Logger, registry *common.Gorou
 	}
 
 	retryDelay := 5 * time.Second
-	if config.RetryDelay != "" {
-		if parsedDelay, err := time.ParseDuration(config.RetryDelay); err == nil && parsedDelay > 0 {
-			retryDelay = parsedDelay
-		}
+	if config.RetryDelay > 0 {
+		retryDelay = config.RetryDelay
 	}
 
 	manager := &Manager{
@@ -565,148 +595,157 @@ func (m *Manager) IsConnected() bool {
 	return client != nil && client.IsConnected()
 }
 
-// SendAction sends an action to the active AMI client with failover
-func (m *Manager) SendAction(action map[string]string) (map[string]string, error) {
-	// Add ActionID if not present
-	if _, ok := action["ActionID"]; !ok {
-		action["ActionID"] = fmt.Sprintf("AMI-%d", time.Now().UnixNano())
-	}
-
-	actionID := action["ActionID"]
-
-	// Store the action for potential replay
-	if m.storage != nil {
-		ctx := context.Background()
-		m.storage.StoreAMIAction(ctx, &storage.AMIAction{
-			ActionID:   actionID,
-			Command:    "action",
-			Params:     action,
-			Timestamp:  time.Now(),
-			ExpireTime: time.Now().Add(1 * time.Hour),
-		})
-	}
-
-	// Get the active client
+// SendAction sends an AMI action with immediate failover on error
+func (m *Manager) SendAction(ctx context.Context, action map[string]string) (map[string]string, error) {
+	m.mu.RLock()
 	client := m.GetActiveClient()
+	m.mu.RUnlock()
 
-	// Check if client is connected
-	if !client.IsConnected() {
-		// Try to connect first
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-
-		if err := client.Connect(ctx); err != nil {
-			m.logger.Warn("Active AMI client not connected and reconnection failed",
-				zap.String("address", client.address),
-				zap.Error(err))
-
-			// Try failover
-			return m.failoverAction(context.Background(), action)
-		}
+	if client == nil {
+		return nil, errors.New("no AMI client available")
 	}
 
-	// Send the action
-	response, err := client.SendAction(action)
+	// Attempt to send action
+	resp, err := client.SendAction(action)
 	if err != nil {
-		m.logger.Warn("AMI action failed, trying failover",
-			zap.String("address", client.address),
-			zap.Error(err))
+		m.logger.Error("SendAction failed, triggering immediate failover",
+			zap.Error(err),
+			zap.String("action", action["Action"]),
+			zap.String("client", client.address))
 
-		return m.failoverAction(context.Background(), action)
+		// Record the failure and trigger immediate failover
+		m.recordClientFailure(client.address)
+
+		// Try failover immediately instead of waiting for next health check
+		if newClient := m.tryFailover(ctx); newClient != nil {
+			m.logger.Info("Immediate failover successful, retrying action with new client",
+				zap.String("oldClient", client.address),
+				zap.String("newClient", newClient.address))
+
+			// Retry with new client
+			return newClient.SendAction(action)
+		}
+
+		return nil, err
 	}
 
-	// Clean up the stored action
-	if m.storage != nil {
-		ctx := context.Background()
-		m.storage.DeleteAMIAction(ctx, actionID)
-	}
-
-	return response, nil
+	return resp, nil
 }
 
-// failoverAction attempts to send an action to a backup AMI client
-func (m *Manager) failoverAction(ctx context.Context, action map[string]string) (map[string]string, error) {
-	// Ensure this operation has a timeout
-	ctx, cancel := common.ContextWithTimeout(ctx, 10*time.Second)
-	defer cancel()
+// recordClientFailure marks a client as unhealthy and increments metrics
+func (m *Manager) recordClientFailure(clientAddr string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Initialize client status if needed
+	if m.clientStatus == nil {
+		m.clientStatus = make([]ClientStatus, len(m.clients))
+		for i := range m.clientStatus {
+			m.clientStatus[i].IsHealthy = true
+		}
+	}
+
+	// Mark the client unhealthy
+	for i, client := range m.clients {
+		if client.address == clientAddr {
+			// Increment fail count
+			m.clientStatus[i].FailCount++
+			m.clientStatus[i].LastFailed = time.Now()
+
+			// Mark as unhealthy if it exceeds threshold
+			threshold := 3 // Default failure threshold
+			if m.clientStatus[i].FailCount >= threshold {
+				m.clientStatus[i].IsHealthy = false
+				m.logger.Warn("AMI client marked unhealthy due to failures",
+					zap.String("client", clientAddr),
+					zap.Int("failCount", m.clientStatus[i].FailCount),
+					zap.Int("threshold", threshold))
+			}
+			break
+		}
+	}
+}
+
+// tryFailover attempts to find and switch to a healthy client
+// Returns the new client if successful, nil otherwise
+func (m *Manager) tryFailover(ctx context.Context) *AMIClient {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	currentClient := m.GetActiveClient()
+	if currentClient == nil {
+		return nil
+	}
+
+	currentAddr := currentClient.address
+	m.logger.Info("Attempting AMI failover", zap.String("from", currentAddr))
+
+	// Initialize client status if needed
+	if m.clientStatus == nil {
+		m.clientStatus = make([]ClientStatus, len(m.clients))
+		for i := range m.clientStatus {
+			m.clientStatus[i].IsHealthy = true
+		}
+	}
+
+	// Find next healthy client
 	currentIdx := atomic.LoadInt32(&m.activeIdx)
+	for i, client := range m.clients {
+		if int32(i) != currentIdx && client.IsConnected() && m.clientStatus[i].IsHealthy {
+			m.logger.Info("Switching to new AMI client",
+				zap.String("from", currentAddr),
+				zap.String("to", client.address))
 
-	// Try each client in turn
-	for i := 0; i < len(m.clients); i++ {
-		idx := (int(currentIdx) + i + 1) % len(m.clients)
-		if idx == int(currentIdx) {
-			continue // Skip the one that just failed
+			// Update current client
+			atomic.StoreInt32(&m.activeIdx, int32(i))
+
+			// Record failover event
+			m.recordFailoverEvent(currentAddr, client.address, "Reactive failover")
+
+			return client
 		}
-
-		client := m.clients[idx]
-
-		// Try to connect if needed
-		if err := client.Connect(ctx); err != nil {
-			m.logger.Warn("AMI failover connection failed",
-				zap.String("address", client.address),
-				zap.Error(err))
-			continue
-		}
-
-		// Try this client
-		response, err := client.SendAction(action)
-
-		if err != nil {
-			m.logger.Warn("AMI failover action failed",
-				zap.String("address", client.address),
-				zap.Error(err))
-			continue
-		}
-
-		// Success - update active client
-		atomic.StoreInt32(&m.activeIdx, int32(idx))
-		m.logger.Info("Switched active AMI client",
-			zap.String("from", m.clients[currentIdx].address),
-			zap.String("to", client.address))
-
-		// Clean up the stored action
-		if m.storage != nil {
-			actionID := action["ActionID"]
-			m.storage.DeleteAMIAction(ctx, actionID)
-		}
-
-		return response, nil
 	}
 
-	// All clients failed
-	actionID := action["ActionID"]
+	m.logger.Error("Failover failed, no healthy client available")
+	return nil
+}
 
-	// Update retry count if we have storage
+// recordFailoverEvent logs a failover for monitoring
+func (m *Manager) recordFailoverEvent(from, to, reason string) {
+	// Store failover event for monitoring
+	event := map[string]interface{}{
+		"component": "ami",
+		"from":      from,
+		"to":        to,
+		"timestamp": time.Now().Unix(),
+		"reason":    reason,
+	}
+
+	jsonBytes, _ := json.Marshal(event)
+
+	// Store in shared storage if available
 	if m.storage != nil {
-		amiAction, err := m.storage.GetAMIAction(ctx, actionID)
-		if err == nil && amiAction != nil {
-			amiAction.Retries++
-			m.storage.StoreAMIAction(ctx, amiAction)
+		storageKey := fmt.Sprintf("failover:ami:%d", time.Now().UnixNano())
+		storeCtx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		defer cancel()
+
+		if err := m.storage.Set(storeCtx, storageKey, jsonBytes, 24*time.Hour); err != nil {
+			m.logger.Error("Failed to store failover event", zap.Error(err))
 		}
 	}
-
-	return nil, fmt.Errorf("all AMI clients failed")
 }
 
 // Originate initiates a call with failover support
-func (m *Manager) Originate(channel, exten, context, priority, application, data, callerId string, timeout int) (map[string]string, error) {
+func (m *Manager) Originate(channel, exten, dialContext, priority, application, data, callerId string, timeout int) (map[string]string, error) {
 	action := map[string]string{
-		"Action": "Originate",
+		"Action":   "Originate",
+		"Channel":  channel,
+		"ActionID": fmt.Sprintf("originate-%d", time.Now().UnixNano()),
 	}
 
-	if channel != "" {
-		action["Channel"] = channel
-	}
-
-	if exten != "" {
+	if exten != "" && dialContext != "" && priority != "" {
 		action["Exten"] = exten
-	}
-
-	if context != "" {
-		action["Context"] = context
-	}
-
-	if priority != "" {
+		action["Context"] = dialContext
 		action["Priority"] = priority
 	}
 
@@ -723,24 +762,29 @@ func (m *Manager) Originate(channel, exten, context, priority, application, data
 	}
 
 	if timeout > 0 {
-		action["Timeout"] = fmt.Sprintf("%d", timeout)
+		action["Timeout"] = fmt.Sprintf("%d", timeout*1000) // Convert to milliseconds
 	}
 
-	return m.SendAction(action)
+	// Use the updated SendAction method
+	ctx := context.Background()
+	return m.SendAction(ctx, action)
 }
 
 // Hangup hangs up a channel with failover support
 func (m *Manager) Hangup(channel, cause string) (map[string]string, error) {
 	action := map[string]string{
-		"Action":  "Hangup",
-		"Channel": channel,
+		"Action":   "Hangup",
+		"Channel":  channel,
+		"ActionID": fmt.Sprintf("hangup-%d", time.Now().UnixNano()),
 	}
 
 	if cause != "" {
 		action["Cause"] = cause
 	}
 
-	return m.SendAction(action)
+	// Use the updated SendAction method
+	ctx := context.Background()
+	return m.SendAction(ctx, action)
 }
 
 // Reconnect attempts to reconnect all clients
@@ -782,4 +826,15 @@ func (m *Manager) Shutdown() {
 	for _, client := range m.clients {
 		client.Disconnect()
 	}
+}
+
+// GetAllClients returns all AMI clients
+func (m *Manager) GetAllClients() []*AMIClient {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	// Return a copy to prevent race conditions
+	clients := make([]*AMIClient, len(m.clients))
+	copy(clients, m.clients)
+	return clients
 }

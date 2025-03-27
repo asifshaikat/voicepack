@@ -32,29 +32,41 @@ type Server struct {
 	handler        SIPHandler
 	logger         *zap.Logger
 	circuitBreaker *common.CircuitBreaker
+	domainProxy    *DomainRewriteProxy
 
-	mu            sync.RWMutex
-	connections   map[string]*ClientConnection
-	wg            sync.WaitGroup
-	backendHealth map[string]bool
-	backendMu     sync.RWMutex
+	mu               sync.RWMutex
+	connections      map[string]*ClientConnection
+	wg               sync.WaitGroup
+	backendHealth    map[string]bool
+	backendMu        sync.RWMutex
+	startTime        time.Time
+	totalConnections int
+	isLeader         bool
+	mux              *http.ServeMux
 }
 
 // ServerConfig defines the configuration for the WebSocket server
 type ServerConfig struct {
-	BindAddr             string
-	CertFile             string
-	KeyFile              string
-	MaxConnections       int
-	ReadTimeout          time.Duration
-	WriteTimeout         time.Duration
-	IdleTimeout          time.Duration
-	EnableIPv4Only       bool
-	ServerName           string        // Kept for backward compatibility
-	BackendServers       []string      // List of WebSocket backend servers
-	FailoverThreshold    int           // Number of errors before failover
-	DisableSIPProcessing bool          // General flag
-	DisableWSSIPProcessing bool        // Specific to WebSocket SIP processing
+	BindAddr                string
+	CertFile                string
+	KeyFile                 string
+	MaxConnections          int
+	ReadTimeout             time.Duration
+	WriteTimeout            time.Duration
+	IdleTimeout             time.Duration
+	EnableIPv4Only          bool
+	ServerName              string   // Kept for backward compatibility
+	BackendServers          []string // List of WebSocket backend servers
+	FailoverThreshold       int      // Number of errors before failover
+	DisableSIPProcessing    bool     // General flag
+	DisableWSSIPProcessing  bool     // Specific to WebSocket SIP processing
+	DisableUDPSIPProcessing bool     // Specific to UDP SIP processing
+
+	// Testing mode fields
+	VerboseLogging           bool          // Enable verbose logging for testing
+	SimulateBackendDelay     time.Duration // Artificial delay for backend responses
+	TestingModeEnabled       bool          // Whether testing mode is active
+	UseInternalHealthHandler bool          // Controls whether to register internal health handler
 }
 
 // SIPHandler handles SIP messages from WebSocket clients
@@ -64,26 +76,26 @@ type SIPHandler interface {
 
 // ClientConnection represents a WebSocket client connection
 type ClientConnection struct {
-	ID               string
-	Conn             *websocket.Conn
-	RemoteAddr       string
-	LocalAddr        string
-	Protocol         string
-	CreateTime       time.Time
-	LastActivity     time.Time
-	SIPAddress       string
-	BackendConn      *websocket.Conn // For proxy scenarios
-	BackendAddr      string
-	CurrentBackend   string          // Currently active backend URL
-	ErrorCount       int             // Count errors for failover threshold
-	LastSIPCallID    string          // For session tracking
-	LastSIPFromTag   string          // For session tracking
-	LastSIPToTag     string          // For session tracking
-	closed           bool
-	closeMu          sync.Mutex
-	clientDone       chan struct{}
-	backendDone      chan struct{}
-	cancelFunc       context.CancelFunc // manage connection context
+	ID             string
+	Conn           *websocket.Conn
+	RemoteAddr     string
+	LocalAddr      string
+	Protocol       string
+	CreateTime     time.Time
+	LastActivity   time.Time
+	SIPAddress     string
+	BackendConn    *websocket.Conn // For proxy scenarios
+	BackendAddr    string
+	CurrentBackend string // Currently active backend URL
+	ErrorCount     int    // Count errors for failover threshold
+	LastSIPCallID  string // For session tracking
+	LastSIPFromTag string // For session tracking
+	LastSIPToTag   string // For session tracking
+	closed         bool
+	closeMu        sync.Mutex
+	clientDone     chan struct{}
+	backendDone    chan struct{}
+	cancelFunc     context.CancelFunc // manage connection context
 }
 
 // NewServer creates a new WebSocket server
@@ -159,7 +171,11 @@ func NewServer(config ServerConfig, storage storage.StateStorage, logger *zap.Lo
 			},
 			logger,
 		),
+		startTime: time.Now(),
+		mux:       http.NewServeMux(),
 	}
+
+	server.domainProxy = NewDomainRewriteProxy(logger)
 
 	return server, nil
 }
@@ -173,9 +189,9 @@ func (s *Server) SetSIPHandler(handler SIPHandler) {
 func (s *Server) UpdateBackendHealth(backend string, healthy bool) {
 	s.backendMu.Lock()
 	defer s.backendMu.Unlock()
-	
+
 	s.backendHealth[backend] = healthy
-	s.logger.Info("Backend health status updated", 
+	s.logger.Info("Backend health status updated",
 		zap.String("backend", backend),
 		zap.Bool("healthy", healthy))
 }
@@ -194,39 +210,109 @@ func (s *Server) testBackendConnection(backend string) bool {
 		return false
 	}
 
-	// Ensure proper WebSocket URL format
+	// Extract host from the WebSocket URL
 	backendURL := backend
 	if !strings.HasPrefix(backendURL, "ws") {
 		backendURL = "wss://" + backendURL
 	}
-	
-	dialer := websocket.Dialer{
-		HandshakeTimeout: 5 * time.Second,
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: true,
-		},
+
+	// Extract the hostname from the URL
+	hostname := strings.TrimPrefix(strings.TrimPrefix(backendURL, "wss://"), "ws://")
+	if idx := strings.IndexByte(hostname, ':'); idx > 0 {
+		hostname = hostname[:idx]
 	}
-	
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	
-	headers := http.Header{}
-	headers.Add("User-Agent", "QalqulVoiceGateway-HealthCheck/1.0")
-	
-	conn, _, err := dialer.DialContext(ctx, backendURL, headers)
+	if idx := strings.IndexByte(hostname, '/'); idx > 0 {
+		hostname = hostname[:idx]
+	}
+
+	// Use port 6060 for OpenSIPS health check via SIP OPTIONS
+	targetAddress := hostname + ":6060"
+
+	s.logger.Debug("Testing OpenSIPS backend with SIP OPTIONS",
+		zap.String("websocket_url", backendURL),
+		zap.String("sip_options_target", targetAddress))
+
+	// Create a SIP OPTIONS message
+	callID := fmt.Sprintf("health-%d", time.Now().UnixNano())
+	branch := fmt.Sprintf("z9hG4bK-%d", time.Now().UnixNano())
+	fromTag := fmt.Sprintf("fromTag-%d", time.Now().UnixNano())
+
+	optionsMsg := fmt.Sprintf(
+		"OPTIONS sip:%s SIP/2.0\r\n"+
+			"Via: SIP/2.0/UDP health.monitor;branch=%s;rport\r\n"+
+			"Max-Forwards: 69\r\n"+
+			"From: <sip:proxy@localhost>;tag=%s\r\n"+
+			"To: <sip:%s>\r\n"+
+			"Call-ID: %s\r\n"+
+			"CSeq: 1 OPTIONS\r\n"+
+			"User-Agent: Qalqul-WebSocket-Health-Monitor\r\n"+
+			"Allow: INVITE, ACK, CANCEL, OPTIONS, BYE\r\n"+
+			"Content-Length: 0\r\n\r\n",
+		hostname,
+		branch,
+		fromTag,
+		hostname,
+		callID,
+	)
+
+	// Get the UDP address
+	udpAddr, err := net.ResolveUDPAddr("udp", targetAddress)
 	if err != nil {
-		s.logger.Debug("Backend health check failed",
-			zap.String("backend", backendURL),
+		s.logger.Debug("Failed to resolve OpenSIPS address for health check",
+			zap.String("target", targetAddress),
 			zap.Error(err))
 		return false
 	}
-	
-	// Gracefully close connection
-	conn.WriteMessage(websocket.CloseMessage, 
-		websocket.FormatCloseMessage(websocket.CloseNormalClosure, "Health check"))
-	conn.Close()
-	
-	return true
+
+	// Connect to the OpenSIPS server
+	conn, err := net.DialUDP("udp", nil, udpAddr)
+	if err != nil {
+		s.logger.Debug("Failed to connect to OpenSIPS for health check",
+			zap.String("target", targetAddress),
+			zap.Error(err))
+		return false
+	}
+	defer conn.Close()
+
+	// Set a timeout
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	// Send OPTIONS message
+	_, err = conn.Write([]byte(optionsMsg))
+	if err != nil {
+		s.logger.Debug("Failed to send OPTIONS message for health check",
+			zap.String("target", targetAddress),
+			zap.Error(err))
+		return false
+	}
+
+	// Read response
+	buffer := make([]byte, 4096)
+	n, _, err := conn.ReadFromUDP(buffer)
+	if err != nil {
+		s.logger.Debug("Failed to read response for health check",
+			zap.String("target", targetAddress),
+			zap.Error(err))
+		return false
+	}
+
+	response := string(buffer[:n])
+
+	// Check for valid responses (200 OK or 405 Method Not Allowed or 403 Forbidden)
+	if strings.Contains(response, "SIP/2.0 200") ||
+		strings.Contains(response, "SIP/2.0 405") ||
+		strings.Contains(response, "SIP/2.0 403") {
+
+		s.logger.Debug("OpenSIPS health check successful",
+			zap.String("target", targetAddress),
+			zap.String("response_code", response[:15]))
+		return true
+	}
+
+	s.logger.Debug("OpenSIPS returned unexpected response for health check",
+		zap.String("target", targetAddress),
+		zap.String("response", response[:100]))
+	return false
 }
 
 // selectHealthyBackend returns a healthy backend from the configured list
@@ -235,17 +321,17 @@ func (s *Server) selectHealthyBackend() string {
 		// If no backends configured, use the ServerName for backward compatibility
 		return s.config.ServerName
 	}
-	
+
 	s.backendMu.RLock()
 	defer s.backendMu.RUnlock()
-	
+
 	// First try to find a known healthy backend
 	for _, backend := range s.config.BackendServers {
 		if healthy, exists := s.backendHealth[backend]; exists && healthy {
 			return backend
 		}
 	}
-	
+
 	// If no known healthy backend, try the first one in the list
 	return s.config.BackendServers[0]
 }
@@ -258,14 +344,20 @@ func (s *Server) Start(ctx context.Context) error {
 		zap.Strings("backendServers", s.config.BackendServers),
 		zap.Bool("disableWSSIPProcessing", s.config.DisableWSSIPProcessing))
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", s.handleWebSocket)
+	// Register handlers
+	s.mux.HandleFunc("/", s.handleWebSocket)
+
+	// Only register the health endpoint if specifically requested
+	if s.config.UseInternalHealthHandler {
+		s.mux.HandleFunc("/health", s.handleHealthCheck)
+		s.logger.Debug("Registered internal health check endpoint at /health")
+	}
 
 	s.logger.Debug("Registered WebSocket handler at root path (/)")
 
 	s.httpServer = &http.Server{
 		Addr:         s.config.BindAddr,
-		Handler:      mux,
+		Handler:      s.mux,
 		ReadTimeout:  s.config.ReadTimeout,
 		WriteTimeout: s.config.WriteTimeout,
 		IdleTimeout:  s.config.IdleTimeout,
@@ -302,7 +394,7 @@ func (s *Server) Start(ctx context.Context) error {
 		s.registry.Go("backend-health-checker", func(ctx context.Context) {
 			ticker := time.NewTicker(30 * time.Second)
 			defer ticker.Stop()
-			
+
 			for {
 				select {
 				case <-ctx.Done():
@@ -510,17 +602,17 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	// Create client connection
 	client := &ClientConnection{
-		ID:             clientID,
-		Conn:           conn,
-		RemoteAddr:     clientAddr,
-		LocalAddr:      r.Host,
-		Protocol:       conn.Subprotocol(),
-		CreateTime:     time.Now(),
-		LastActivity:   time.Now(),
-		clientDone:     make(chan struct{}),
-		backendDone:    make(chan struct{}),
-		cancelFunc:     wsCancel,
-		ErrorCount:     0,
+		ID:           clientID,
+		Conn:         conn,
+		RemoteAddr:   clientAddr,
+		LocalAddr:    r.Host,
+		Protocol:     conn.Subprotocol(),
+		CreateTime:   time.Now(),
+		LastActivity: time.Now(),
+		clientDone:   make(chan struct{}),
+		backendDone:  make(chan struct{}),
+		cancelFunc:   wsCancel,
+		ErrorCount:   0,
 	}
 
 	// Store the connection
@@ -601,6 +693,26 @@ func (s *Server) handleClient(ctx context.Context, client *ClientConnection, sip
 		zap.String("clientID", client.ID),
 		zap.String("backend", backendURL),
 	)
+
+	// Set up domain mapping for this client
+	// Extract target domain from backend URL
+	targetDomain := ""
+	if strings.Contains(client.CurrentBackend, "qa.qalqul.io") {
+		targetDomain = "qa.qalqul.io"
+	} else if strings.Contains(client.CurrentBackend, "businessoperations.qalqul.io") {
+		targetDomain = "businessoperations.qalqul.io"
+	}
+
+	// Create domain mapping
+	if targetDomain != "" {
+		// Map both platform and businessoperations domains to the target domain
+		s.domainProxy.SetDomainMapping(client.ID, "platform.qalqul.io", targetDomain)
+		s.domainProxy.SetDomainMapping(client.ID, "businessoperations.qalqul.io", targetDomain)
+
+		s.logger.Info("Set up domain mappings for client",
+			zap.String("clientID", client.ID),
+			zap.String("targetDomain", targetDomain))
+	}
 
 	//-------------------------------------------------------------------
 	// 1) Keepalive: SIP OPTIONS to the WebSocket client
@@ -700,6 +812,11 @@ func (s *Server) handleClient(ctx context.Context, client *ClientConnection, sip
 						s.extractSIPState(sipMsg, client)
 					}
 				}
+				// Add this code to rewrite domains before forwarding to backend
+				if msgType == websocket.TextMessage && len(msg) > 0 {
+					// Rewrite the domains in the message
+					msg = s.domainProxy.RewriteClientToBackend(client.ID, msg)
+				}
 
 				// Forward to backend if it exists
 				if client.BackendConn != nil {
@@ -710,10 +827,10 @@ func (s *Server) handleClient(ctx context.Context, client *ClientConnection, sip
 							zap.String("backend", client.CurrentBackend),
 							zap.Error(err),
 						)
-						
+
 						// Increment error count
 						client.ErrorCount++
-						
+
 						// Check if we need to failover based on threshold
 						if client.ErrorCount >= s.config.FailoverThreshold {
 							s.logger.Warn("Backend error threshold reached, attempting failover",
@@ -721,10 +838,10 @@ func (s *Server) handleClient(ctx context.Context, client *ClientConnection, sip
 								zap.String("currentBackend", client.CurrentBackend),
 								zap.Int("errorCount", client.ErrorCount),
 								zap.Int("threshold", s.config.FailoverThreshold))
-							
+
 							// Mark current backend as unhealthy
 							s.UpdateBackendHealth(client.CurrentBackend, false)
-							
+
 							// Try to connect to a new backend
 							newBackendURL := s.selectHealthyBackend()
 							if newBackendURL != "" && newBackendURL != client.CurrentBackend {
@@ -734,29 +851,29 @@ func (s *Server) handleClient(ctx context.Context, client *ClientConnection, sip
 										zap.String("clientID", client.ID),
 										zap.String("oldBackend", client.CurrentBackend),
 										zap.String("newBackend", newBackendURL))
-									
+
 									// Close old connection
 									client.BackendConn.Close()
-									
+
 									// Update connection info
 									client.BackendConn = newConn
 									client.BackendAddr = newBackendURL
 									client.CurrentBackend = newBackendURL
 									client.ErrorCount = 0
-									
+
 									// Retry sending the message
 									if retryErr := newConn.WriteMessage(msgType, msg); retryErr != nil {
 										s.logger.Error("Failed to forward message to new backend after failover",
 											zap.String("clientID", client.ID),
 											zap.Error(retryErr))
-										
+
 										// Continue despite error - next message might succeed
 									} else {
 										s.logger.Debug("Successfully forwarded message to new backend after failover",
 											zap.String("clientID", client.ID),
 											zap.String("backend", newBackendURL))
 									}
-									
+
 									// Continue with new backend
 									continue
 								} else {
@@ -771,15 +888,15 @@ func (s *Server) handleClient(ctx context.Context, client *ClientConnection, sip
 									zap.String("currentBackend", client.CurrentBackend))
 							}
 						}
-						
+
 						// Continue despite error - connection will be closed if needed
 						errChan <- fmt.Errorf("backend write: %w", err)
 						return
 					}
-					
+
 					// Reset error count on successful message
 					client.ErrorCount = 0
-					
+
 					s.logger.Debug("Forwarded message to backend",
 						zap.String("client", client.ID),
 						zap.String("backend", client.BackendAddr),
@@ -795,7 +912,7 @@ func (s *Server) handleClient(ctx context.Context, client *ClientConnection, sip
 						if req, ok := sipMsg.(*sip.Request); ok {
 							if req.From() != nil {
 								client.SIPAddress = req.From().Address.String()
-								
+
 								// THIS IS THE FIX: Check DisableWSSIPProcessing specifically for WebSocket SIP processing
 								if s.handler != nil && !s.config.DisableWSSIPProcessing {
 									// create virtual address for the client
@@ -804,12 +921,12 @@ func (s *Server) handleClient(ctx context.Context, client *ClientConnection, sip
 										network:  sipTransport,
 										address:  client.RemoteAddr,
 									}
-									
+
 									s.logger.Debug("Processing SIP message from WebSocket",
 										zap.String("clientID", client.ID),
 										zap.String("method", req.Method.String()),
 										zap.Bool("DisableWSSIPProcessing", s.config.DisableWSSIPProcessing))
-										
+
 									if err := s.handler.HandleMessage(sipMsg, addr); err != nil {
 										// Log error but don't fail connection
 										s.logger.Error("SIP handler error",
@@ -866,10 +983,10 @@ func (s *Server) handleClient(ctx context.Context, client *ClientConnection, sip
 							zap.String("backend", client.BackendAddr),
 							zap.Error(err),
 						)
-						
+
 						// Increment error count
 						client.ErrorCount++
-						
+
 						// Check if we need to failover based on threshold
 						if client.ErrorCount >= s.config.FailoverThreshold {
 							s.logger.Warn("Backend read error threshold reached, attempting failover",
@@ -877,10 +994,10 @@ func (s *Server) handleClient(ctx context.Context, client *ClientConnection, sip
 								zap.String("currentBackend", client.CurrentBackend),
 								zap.Int("errorCount", client.ErrorCount),
 								zap.Int("threshold", s.config.FailoverThreshold))
-							
+
 							// Mark current backend as unhealthy
 							s.UpdateBackendHealth(client.CurrentBackend, false)
-							
+
 							// Try to connect to a new backend
 							newBackendURL := s.selectHealthyBackend()
 							if newBackendURL != "" && newBackendURL != client.CurrentBackend {
@@ -890,22 +1007,84 @@ func (s *Server) handleClient(ctx context.Context, client *ClientConnection, sip
 										zap.String("clientID", client.ID),
 										zap.String("oldBackend", client.CurrentBackend),
 										zap.String("newBackend", newBackendURL))
-									
+
 									// Update connection info
 									client.BackendConn = newConn
 									client.BackendAddr = newBackendURL
 									client.CurrentBackend = newBackendURL
 									client.ErrorCount = 0
-									
+
 									// Continue with the new backend
 									continue
 								}
 							}
 						}
-						
+
 						errChan <- fmt.Errorf("backend read: %w", err)
 					}
 					return
+				}
+
+				// Process the message if SIP (before forwarding to client)
+				if (msgType == websocket.TextMessage || msgType == websocket.BinaryMessage) && len(msg) > 0 {
+					sipMsg, parseErr := sip.ParseMessage(msg)
+					if parseErr == nil {
+						// Extract SIP state for session tracking
+						s.extractSIPState(sipMsg, client)
+
+						// Check if it's a CANCEL or BYE message - these must be forwarded
+						isCriticalMethod := false
+						if req, ok := sipMsg.(*sip.Request); ok {
+							method := req.Method.String()
+							if method == "CANCEL" || method == "BYE" {
+								isCriticalMethod = true
+								s.logger.Debug("Critical SIP method detected from backend",
+									zap.String("clientID", client.ID),
+									zap.String("method", method),
+									zap.String("backend", client.CurrentBackend))
+							}
+						}
+
+						// Add SIP processing for messages from backend to client
+						if (s.handler != nil && !s.config.DisableWSSIPProcessing) || isCriticalMethod {
+							// Create virtual address for the backend
+							addr := &websocketAddr{
+								clientID: "backend-" + client.CurrentBackend,
+								network:  "wss",
+								address:  client.CurrentBackend,
+							}
+
+							s.logger.Debug("Processing SIP message from backend",
+								zap.String("clientID", client.ID),
+								zap.String("backend", client.CurrentBackend),
+								zap.String("msgType", msgTypeToString(msgType)))
+
+							if resp, ok := sipMsg.(*sip.Response); ok {
+								s.logger.Debug("SIP response from backend",
+									zap.String("clientID", client.ID),
+									zap.Int("statusCode", resp.StatusCode),
+									zap.String("reason", resp.Reason))
+							}
+
+							// Pass through SIP handler
+							if err := s.handler.HandleMessage(sipMsg, addr); err != nil {
+								// Log error but don't fail connection
+								s.logger.Error("SIP handler error for backend message",
+									zap.String("clientID", client.ID),
+									zap.String("backend", client.CurrentBackend),
+									zap.Error(err))
+							}
+						} else {
+							s.logger.Debug("Skipping SIP processing for backend message (disabled by config)",
+								zap.String("clientID", client.ID),
+								zap.Bool("DisableWSSIPProcessing", s.config.DisableWSSIPProcessing))
+						}
+					} else {
+						s.logger.Debug("Failed to parse SIP message from backend",
+							zap.String("clientID", client.ID),
+							zap.String("backend", client.CurrentBackend),
+							zap.Error(parseErr))
+					}
 				}
 
 				// Forward to client
@@ -963,7 +1142,7 @@ func (s *Server) connectToBackend(backendURL string, client *ClientConnection) (
 	backendHeaders.Add("Origin", "https://"+host)
 	backendHeaders.Add("Host", host)
 	backendHeaders.Add("User-Agent", "QalqulVoiceGateway/1.0")
-	
+
 	// Add SIP session info if available for session continuity during failover
 	if client.LastSIPCallID != "" {
 		backendHeaders.Add("X-SIP-Call-ID", client.LastSIPCallID)
@@ -1003,48 +1182,49 @@ func (s *Server) connectToBackend(backendURL string, client *ClientConnection) (
 
 // extractSIPState extracts key session identifiers from SIP messages
 func (s *Server) extractSIPState(sipMsg sip.Message, client *ClientConnection) {
-    if req, ok := sipMsg.(*sip.Request); ok {
-        // Extract Call-ID
-        if callID := req.CallID(); callID != nil {
-            client.LastSIPCallID = callID.Value()
-        }
-        
-        // Extract From tag
-        if from := req.From(); from != nil && from.Params != nil {
-            if tag, exists := from.Params.Get("tag"); exists && tag != "" {
-                client.LastSIPFromTag = tag
-            }
-        }
-        
-        // Extract To tag
-        if to := req.To(); to != nil && to.Params != nil {
-            if tag, exists := to.Params.Get("tag"); exists && tag != "" {
-                client.LastSIPToTag = tag
-            }
-        }
-        
-        // Store SIP identity in storage for recovery purposes
-        if client.LastSIPCallID != "" {
-            ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-            defer cancel()
-            
-            stateKey := fmt.Sprintf("sip:session:%s", client.LastSIPCallID)
-            stateData := map[string]string{
-                "clientID": client.ID,
-                "callID": client.LastSIPCallID,
-                "fromTag": client.LastSIPFromTag,
-                "toTag": client.LastSIPToTag,
-                "backend": client.CurrentBackend,
-                "timestamp": fmt.Sprintf("%d", time.Now().Unix()),
-            }
-            
-            jsonBytes, err := json.Marshal(stateData)
-            if err == nil {
-                s.storage.Set(ctx, stateKey, jsonBytes, 1*time.Hour)
-            }
-        }
-    }
+	if req, ok := sipMsg.(*sip.Request); ok {
+		// Extract Call-ID
+		if callID := req.CallID(); callID != nil {
+			client.LastSIPCallID = callID.Value()
+		}
+
+		// Extract From tag
+		if from := req.From(); from != nil && from.Params != nil {
+			if tag, exists := from.Params.Get("tag"); exists && tag != "" {
+				client.LastSIPFromTag = tag
+			}
+		}
+
+		// Extract To tag
+		if to := req.To(); to != nil && to.Params != nil {
+			if tag, exists := to.Params.Get("tag"); exists && tag != "" {
+				client.LastSIPToTag = tag
+			}
+		}
+
+		// Store SIP identity in storage for recovery purposes
+		if client.LastSIPCallID != "" {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+
+			stateKey := fmt.Sprintf("sip:session:%s", client.LastSIPCallID)
+			stateData := map[string]string{
+				"clientID":  client.ID,
+				"callID":    client.LastSIPCallID,
+				"fromTag":   client.LastSIPFromTag,
+				"toTag":     client.LastSIPToTag,
+				"backend":   client.CurrentBackend,
+				"timestamp": fmt.Sprintf("%d", time.Now().Unix()),
+			}
+
+			jsonBytes, err := json.Marshal(stateData)
+			if err == nil {
+				s.storage.Set(ctx, stateKey, jsonBytes, 1*time.Hour)
+			}
+		}
+	}
 }
+
 // Implementation of net.Addr for WebSocket clients
 type websocketAddr struct {
 	clientID string
@@ -1204,19 +1384,34 @@ func (s *Server) StartHealthMonitoring(ctx context.Context) {
 		}
 	})
 }
-// Add to websocket/server.go
-func (s *Server) HasHealthyBackends() bool {
-    s.backendMu.RLock()
-    defer s.backendMu.RUnlock()
-    
-    for _, healthy := range s.backendHealth {
-        if healthy {
-            return true
-        }
-    }
-    
-    return false
+
+// HasBackends returns true if there are backend servers configured
+func (s *Server) HasBackends() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.config.BackendServers) > 0
 }
+
+// HasHealthyBackends returns true if at least one backend is healthy
+func (s *Server) HasHealthyBackends() bool {
+	s.backendMu.RLock()
+	defer s.backendMu.RUnlock()
+
+	// Check if there are any backends configured
+	if len(s.backendHealth) == 0 {
+		return false
+	}
+
+	// Check if at least one backend is healthy
+	for _, healthy := range s.backendHealth {
+		if healthy {
+			return true
+		}
+	}
+
+	return false
+}
+
 // closeConnection closes a client connection
 func (s *Server) closeConnection(client *ClientConnection) {
 	client.closeMu.Lock()
@@ -1351,4 +1546,155 @@ func msgTypeToString(mt int) string {
 	default:
 		return "unknown"
 	}
+}
+
+// handleHealthCheck handles health check requests
+func (s *Server) handleHealthCheck(w http.ResponseWriter, r *http.Request) {
+	s.logger.Debug("Received health check request",
+		zap.String("remoteAddr", r.RemoteAddr),
+		zap.String("userAgent", r.UserAgent()))
+
+	// Check components health
+	allBackendsHealthy := s.HasHealthyBackends()
+
+	// Check storage health
+	storageHealthy := s.checkStorageHealth()
+
+	// Get connection count
+	s.mu.RLock()
+	connectionCount := len(s.connections)
+	clientStats := s.getClientStats()
+	s.mu.RUnlock()
+
+	// Get backend health details
+	s.backendMu.RLock()
+	backendStatus := make(map[string]map[string]interface{})
+	for backend, healthy := range s.backendHealth {
+		backendStatus[backend] = map[string]interface{}{
+			"healthy":      healthy,
+			"last_checked": time.Now().Format(time.RFC3339),
+		}
+	}
+	s.backendMu.RUnlock()
+
+	// Determine overall status
+	status := "healthy"
+	statusCode := http.StatusOK
+
+	if !allBackendsHealthy {
+		status = "unhealthy"
+		statusCode = http.StatusServiceUnavailable
+	}
+
+	// Create detailed response
+	response := map[string]interface{}{
+		"status":      status,
+		"connections": connectionCount,
+		"timestamp":   time.Now().Format(time.RFC3339),
+		"backends":    backendStatus,
+		"storage": map[string]interface{}{
+			"healthy": storageHealthy,
+			"type":    "memory", // Change to "redis" if using Redis
+		},
+		"service":        "WebRTC-SIP Gateway",
+		"version":        "1.0",
+		"uptime_seconds": int(time.Since(s.startTime).Seconds()),
+		"client_stats":   clientStats,
+		"is_leader":      s.isLeader,
+		"health_details": map[string]interface{}{
+			"websocket_server": map[string]interface{}{
+				"status": status,
+				"reason": getHealthReason(allBackendsHealthy, storageHealthy),
+			},
+		},
+	}
+
+	// Send JSON response
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		s.logger.Error("Failed to encode health response",
+			zap.Error(err))
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+}
+
+// checkStorageHealth checks if the storage is healthy
+func (s *Server) checkStorageHealth() bool {
+	if s.storage == nil {
+		return false
+	}
+
+	// Simple health check - write and read a test value
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	testKey := "health_check_test"
+	testValue := []byte(fmt.Sprintf("test_%d", time.Now().UnixNano()))
+
+	err := s.storage.Set(ctx, testKey, testValue, 5*time.Second)
+	if err != nil {
+		s.logger.Warn("Storage health check failed - set operation failed",
+			zap.Error(err))
+		return false
+	}
+
+	_, err = s.storage.Get(ctx, testKey)
+	if err != nil {
+		s.logger.Warn("Storage health check failed - get operation failed",
+			zap.Error(err))
+		return false
+	}
+
+	return true
+}
+
+// getClientStats returns statistics about connected clients
+func (s *Server) getClientStats() map[string]interface{} {
+	stats := map[string]interface{}{
+		"active":            0,
+		"total_since_start": s.totalConnections,
+		"registrations":     0,
+	}
+
+	// Count active connections
+	stats["active"] = len(s.connections)
+
+	// Count SIP registrations if available
+	registrations := 0
+	for _, client := range s.connections {
+		if client.SIPAddress != "" {
+			registrations++
+		}
+	}
+	stats["registrations"] = registrations
+
+	return stats
+}
+
+// getHealthReason returns a reason string explaining the health status
+func getHealthReason(backendsHealthy, storageHealthy bool) string {
+	var reasons []string
+
+	if !backendsHealthy {
+		reasons = append(reasons, "no healthy backends available")
+	}
+
+	if !storageHealthy {
+		reasons = append(reasons, "storage not healthy")
+	}
+
+	if len(reasons) == 0 {
+		return "all systems operational"
+	}
+
+	return strings.Join(reasons, ", ")
+}
+
+// GetHTTPHandler returns the HTTP handler for the WebSocket server
+// so that additional endpoints can be registered.
+func (s *Server) GetHTTPHandler() *http.ServeMux {
+	return s.mux
 }
